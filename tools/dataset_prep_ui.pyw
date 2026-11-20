@@ -564,6 +564,10 @@ class DatasetPrepWindow(QMainWindow):
             b.clicked.connect(lambda _, t=target: self._open_folder(t()))
             open_row.addWidget(b)
         open_row.addStretch()
+        deploy_btn = QPushButton("Deploy checkpoints to pretrained")
+        deploy_btn.setToolTip("Backs up existing .pth/.json files in pretrained_models/mosaic/ and copies the latest *_G.pth + .json for each bucket.")
+        deploy_btn.clicked.connect(self._deploy_checkpoints)
+        open_row.insertWidget(open_row.count() - 1, deploy_btn)
         c4.layout().addLayout(open_row)
 
         col.addStretch()
@@ -821,6 +825,25 @@ class DatasetPrepWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
         else:
             self._log(f"Folder does not exist yet: {path}")
+
+    def _deploy_checkpoints(self):
+        import io, contextlib
+        manifest_path = self._path_fields['model_manifest'].text().strip()
+        if not manifest_path or not os.path.isfile(manifest_path):
+            QMessageBox.warning(self, "Manifest missing", "Size manifest not found (check Folders & models tab).")
+            return
+        try:
+            import deploy_checkpoints
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                n = deploy_checkpoints.deploy_all(manifest_path=manifest_path)
+            self._log("\n=== Deploy checkpoints ===\n" + buf.getvalue().strip())
+            self._load_manifest()
+            self._refresh_status()
+            QMessageBox.information(self, "Deployed", f"Deployed {n} bucket checkpoint(s) to {os.path.dirname(manifest_path)}.")
+        except Exception as e:
+            self._log(f"Deploy failed: {e}")
+            QMessageBox.warning(self, "Deploy failed", str(e))
 
     # ------------------------------------------------------------ status --
     def _refresh_status(self):
