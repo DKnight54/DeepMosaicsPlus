@@ -1041,6 +1041,13 @@ class MainWindow(QMainWindow):
         mlb = _browse()
         mlb.clicked.connect(lambda: self._pick_file(self.model_in, "Select model", "Models (*.pth)"))
         sb.addLayout(_row(_rl("Model"), self.model_in, mlb))
+        self.auto_model_cb = QCheckBox("Auto-select model by mosaic size (--auto_model)")
+        self.auto_model_cb.setToolTip(
+            "Automatically measure each scene's mosaic block size and pick the matching\n"
+            "bucket model from pretrained_models/mosaic/size_manifest.json.\n"
+            "Falls back to the Model path above if confidence is low.")
+        self.auto_model_cb.toggled.connect(lambda checked: self.model_in.setEnabled(not checked))
+        sb.addWidget(self.auto_model_cb)
         self.infer_size_sel = QComboBox()
         self.infer_size_sel.addItems(["Auto", "256", "384", "512"])
         self.infer_size_sel.setToolTip(
@@ -1301,6 +1308,8 @@ class MainWindow(QMainWindow):
         if d and d != "00:00:00" and self.dur_in.isEnabled():   cmd.extend(["-t", d])
         mdl = self.model_in.text().strip()
         if mdl:                             cmd.extend(["--model_path", mdl])
+        if self.auto_model_cb.isChecked():
+            cmd.append("--auto_model")
         media_text = self.media_in.text().strip().strip('"')
         if self._is_image(media_text):
             fmt = self.img_fmt_sel.currentData()

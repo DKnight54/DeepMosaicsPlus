@@ -9,6 +9,9 @@ import numpy as np
 
 torch.set_float32_matmul_precision('high')
 
+def _is_yolo(net):
+    return hasattr(net, 'detect') and not hasattr(net, 'parameters')
+
 def run_segment(img,net,size = 360,gpu_id = '-1'):
     img = impro.resize(img,size)
     img = data.im2tensor(img, gpu_id = gpu_id, bgr2rgb = False, is0_1 = True)
@@ -166,7 +169,17 @@ def run_styletransfer(opt, net, img):
     img = data.tensor2im(img)
     return img
 
-def get_ROI_position(img,net,opt,keepsize=True):
+def get_ROI_position(img, net, opt, keepsize=True):
+    if _is_yolo(net):
+        mask, x, y, halfsize = net.detect(img, opt)
+        if mask is None:
+            mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        if not keepsize:
+            mask = impro.resize(mask, 360)
+            x, y, halfsize, area = impro.boundingSquare(mask, 1)
+            return mask, x, y, halfsize, area
+        area = int(np.sum(mask > 0))
+        return mask, x, y, halfsize, area
     mask = run_segment(img,net,size=360,gpu_id = opt.gpu_id)
     mask = impro.mask_threshold(mask,opt.mask_extend,opt.mask_threshold)
     if keepsize:
@@ -187,6 +200,12 @@ def run_segment_batch(imgs, net, size=360):
 
 def get_mosaic_position(img_origin, net_mosaic_pos, opt):
     # Run segmentation
+    if _is_yolo(net_mosaic_pos):
+        try:
+            return net_mosaic_pos.detect(img_origin, opt)
+        except Exception as e:
+            print(f"YOLO segmentation error: {e}")
+            return None, 0, 0, 0
     try:
         mask = run_segment(img_origin, net_mosaic_pos, size=360, gpu_id=opt.gpu_id)
     except Exception as e:
@@ -202,6 +221,15 @@ def get_mosaic_positions_batch(imgs, net_mosaic_pos, opt, pool=None):
     calling get_mosaic_position per frame. Falls back to per-frame calls when the
     frames differ in size, on DirectML (kept on its proven per-frame path) or if
     the batched pass fails."""
+    if _is_yolo(net_mosaic_pos):
+        if not imgs:
+            return []
+        if len(imgs) > 1 and hasattr(net_mosaic_pos, 'detect_batch'):
+            try:
+                return net_mosaic_pos.detect_batch(imgs, opt)
+            except Exception as e:
+                print(f"Batched YOLO segmentation failed ({e}); using one frame at a time")
+        return [get_mosaic_position(img, net_mosaic_pos, opt) for img in imgs]
     device = next(net_mosaic_pos.parameters()).device
     same = len({img.shape for img in imgs}) == 1
     masks = None

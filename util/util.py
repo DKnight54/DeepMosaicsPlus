@@ -76,24 +76,21 @@ def loadjson(path):
 
 def makedirs(path):
     if os.path.isdir(path):
-        print(path,'existed')
+        print(path,'\nexisted')
     else:
         os.makedirs(path)
-        print('makedir:',path)
+        print('\nmakedir:',path)
 
-def clean_tempfiles(opt,tmp_init=True):
+def clean_tempfiles(opt, tmp_init=True, quiet=False):
     tmpdir = opt.temp_dir
     if not tmp_init and getattr(opt, 'keep_temp', False):
-        # End of a finished run with --keep_temp: keep the frames for the UI's
-        # preview, but remove the resume marker so the finished run isn't
-        # offered as "unfinished" next time. The next run's file_init()
-        # (tmp_init=True) still clears everything as usual.
         marker = os.path.join(tmpdir, 'step.json')
         if os.path.isfile(marker):
             os.remove(marker)
         return
-    if os.path.isdir(tmpdir): 
-        print('Clean temp...')  
+    if os.path.isdir(tmpdir):
+        if not quiet:
+            print('Clean temp...')
         shutil.rmtree(tmpdir)
     if tmp_init:
         os.makedirs(tmpdir)

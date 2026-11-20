@@ -22,14 +22,19 @@ opt = Options()
 import random
 import datetime
 import time
+from tqdm import tqdm
 
 import numpy as np
 import cv2
 import torch
+import contextlib, io
+
 
 from models import runmodel,loadmodel
+from models.yolo_mosaic_detector import YoloMosaicDetector
 import util.image_processing as impro
 from util import filt, util,mosaic,data,ffmpeg
+
 
 
 opt.parser.add_argument('--datadir',type=str,default='your video dir', help='')
@@ -50,6 +55,8 @@ opt.parser.add_argument('--outsize', type=int ,default= 572,help='size (px) crop
 opt.parser.add_argument('--startcnt', type=int ,default= 0,help='')
 opt.parser.add_argument('--minsize', type=int ,default= 96,help='minimal roi size')
 opt.parser.add_argument('--no_sclectscene', action='store_true', help='')  
+opt.parser.add_argument('--yolo_conf', type=float, default=0.35)
+
 opt = opt.getparse()
 
 
@@ -67,12 +74,20 @@ if not videopaths:
 random.shuffle(videopaths)
 
 # def network
-net = loadmodel.bisenet(opt,'roi')
+if opt.model_path.lower().endswith(('.pt', '.onnx')):
+    net = YoloMosaicDetector(opt.model_path, conf_thresh=0.35)
+else:
+    net = loadmodel.bisenet(opt, 'roi')
 
 result_cnt = opt.startcnt
 native_sides = []   # source-resolution side length of every saved crop (before resizing to --outsize)
 video_cnt = 1
 starttime = datetime.datetime.now()
+
+def quiet_clean_temp(opt):
+    with contextlib.redirect_stdout(io.StringIO()):
+        util.clean_tempfiles(opt)
+        
 for videopath in videopaths:
     try:
         if opt.no_sclectscene:
@@ -80,8 +95,23 @@ for videopath in videopaths:
         else:
             timestamps=[]
             fps,endtime,height,width = ffmpeg.get_video_infos(videopath)
-            for cut_point in range(1,int((endtime-opt.time)/opt.interval)):
-                util.clean_tempfiles(opt)
+            vname = os.path.basename(videopath)
+            short_name = (vname[:28] + '...') if len(vname) > 31 else vname
+            max_cut = int((endtime - opt.time) / opt.interval)
+            if endtime >= opt.time:
+                cut_points = range(0, max(1, max_cut))
+            else:
+                cut_points = range(0)
+            pbar = tqdm(
+                cut_points,
+                desc=f"[{video_cnt}/{len(videopaths)}] Scanning {short_name}",
+                unit="clip",
+                leave=True,
+            )
+            for cut_point in pbar:
+                stamp = util.second2stamp(cut_point * opt.interval)
+                pbar.set_postfix_str(f"t={stamp} hits={len(timestamps)}", refresh=False)
+                util.clean_tempfiles(opt, quiet=True)
                 ffmpeg.video2image(videopath, opt.temp_dir+'/video2image/%05d.'+opt.tempimage_type,fps=1,
                     start_time = util.second2stamp(cut_point*opt.interval),last_time = util.second2stamp(opt.time))
                 imagepaths = util.Traversal(opt.temp_dir+'/video2image')
@@ -89,7 +119,12 @@ for videopath in videopaths:
                 cnt = 0 
                 for i in range(opt.time):
                     img = impro.imread(imagepaths[i])
-                    mask = runmodel.get_ROI_position(img,net,opt,keepsize=True)[0]
+                    if isinstance(net, YoloMosaicDetector):
+                        mask, _, _, _ = net.detect(img, opt)
+                        if mask is None:
+                            mask = np.zeros(img.shape[:2], dtype=np.uint8)
+                    else:
+                        mask = runmodel.get_ROI_position(img, net, opt, keepsize=True)[0]
                     if not opt.all_mosaic_area:
                         mask = impro.find_mostlikely_ROI(mask)
                     x,y,size,area = impro.boundingSquare(mask,Ex_mul=1)
@@ -102,15 +137,15 @@ for videopath in videopaths:
         #print(timestamps)
 
         #generate datasets
-        print('Generate datasets...')
-        for timestamp in timestamps:
+        print(f"Generate datasets ({len(timestamps)} scene(s) found)...")
+        for timestamp in tqdm(timestamps, desc=f"[{video_cnt}/{len(videopaths)}] Extracting", unit="scene", leave=True):
             savecnt = '%05d' % result_cnt
             origindir = os.path.join(opt.savedir,savecnt,'origin_image')
             maskdir = os.path.join(opt.savedir,savecnt,'mask')
             util.makedirs(origindir)
             util.makedirs(maskdir)
 
-            util.clean_tempfiles(opt)
+            util.clean_tempfiles(opt, quiet=True)
             ffmpeg.video2image(videopath, opt.temp_dir+'/video2image/%05d.'+opt.tempimage_type,
                 fps=opt.fps, start_time = timestamp,last_time = util.second2stamp(opt.time))
             
@@ -149,7 +184,12 @@ for videopath in videopaths:
             positions = []
             for imagepath in imagepaths:
                 img = impro.imread(imagepath)
-                mask = runmodel.get_ROI_position(img,net,opt,keepsize=True)[0]
+                if isinstance(net, YoloMosaicDetector):
+                    mask, _, _, _ = net.detect(img, opt)
+                    if mask is None:
+                        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+                else:
+                    mask = runmodel.get_ROI_position(img, net, opt, keepsize=True)[0]
                 imgs.append(img)
                 masks.append(mask)
                 x,y,size,area = impro.boundingSquare(mask,Ex_mul=ex_mul)

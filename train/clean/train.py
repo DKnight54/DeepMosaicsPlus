@@ -270,7 +270,7 @@ if __name__ == '__main__':
                 frame_dir = os.path.join(video_path,'mask')
             if os.path.isdir(frame_dir) and len(os.listdir(frame_dir))>=opt.M:
                 videolist.append(video)
-    sorted(videolist)
+    videolist = sorted(videolist)
     # Frames are resized so their short side is --loadsize. If the dataset was built with a
     # smaller --outsize, every frame is ENLARGED: slower and more memory, but no extra detail.
     _sides = []
@@ -286,8 +286,16 @@ if __name__ == '__main__':
             print(f"** WARNING: the dataset frames are about {_med}px, but training resizes them to {opt.loadsize}px, so they "
                   f"are enlarged {opt.loadsize/_med:.1f}x -- no extra detail, just more memory and time. Rebuild the dataset "
                   f"with --outsize {opt.loadsize} (or train at --finesize {int(round(_med * 256 / 286))}). **")
-    videolist_train = videolist[:int(len(videolist)*0.8)].copy()
-    videolist_eval = videolist[int(len(videolist)*0.8):].copy()
+    real_clips = [v for v in videolist if os.path.isdir(os.path.join(opt.dataset, v, 'mosaic_image'))]
+    synth_clips = [v for v in videolist if not os.path.isdir(os.path.join(opt.dataset, v, 'mosaic_image'))]
+
+    s_cut = int(len(synth_clips) * 0.8)
+    r_cut = int(len(real_clips) * 0.8)
+
+    videolist_train = synth_clips[:s_cut] + real_clips[:r_cut]
+    videolist_eval  = synth_clips[s_cut:] + real_clips[r_cut:]
+    print(f"Dataset split: {len(synth_clips[:s_cut])} synth + {len(real_clips[:r_cut])} real train | "
+          f"{len(synth_clips[s_cut:])} synth + {len(real_clips[r_cut:])} real eval", flush=True)
 
     # Every loader process imports PyTorch (~2 GB of memory on Windows) and keeps the frames of a whole
     # batch of clips in RAM. Too many of them fill RAM before the GPU is even used, so cap the number

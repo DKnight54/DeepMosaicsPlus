@@ -63,17 +63,36 @@ def video(opt):
     netG.eval()
     return netG
 
-def bisenet(opt,type='roi'):
+def bisenet(opt, type='roi'):
     '''
     type: roi or mosaic
     '''
-    net = BiSeNet(num_classes=1, context_path='resnet18',train_flag=False)
-    show_paramsnumber(net,'segment')
+    target_path = opt.model_path if type == 'roi' else opt.mosaic_position_model_path
+
+    # If 'auto', prefer a .pt/.onnx Lada detector in pretrained_models/mosaic/ if present
+    if type == 'mosaic' and (not target_path or target_path == 'auto'):
+        mosaic_dir = os.path.join('pretrained_models', 'mosaic')
+        if os.path.isdir(mosaic_dir):
+            for fname in sorted(os.listdir(mosaic_dir)):
+                if fname.lower().endswith(('.pt', '.onnx')) and 'mosaic' in fname.lower():
+                    target_path = os.path.join(mosaic_dir, fname)
+                    break
+
+    if target_path and target_path.lower().endswith(('.pt', '.onnx')):
+        from .yolo_mosaic_detector import YoloMosaicDetector
+        return YoloMosaicDetector(
+            target_path,
+            conf_thresh=0.35,
+            gpu_id=getattr(opt, 'gpu_id', '0'),
+        )
+
+    net = BiSeNet(num_classes=1, context_path='resnet18', train_flag=False)
+    show_paramsnumber(net, 'segment')
     if type == 'roi':
         net.load_state_dict(torch.load(opt.model_path))
     elif type == 'mosaic':
         net.load_state_dict(torch.load(opt.mosaic_position_model_path))
-    net = model_util.todevice(net,opt.gpu_id)
+    net = model_util.todevice(net, opt.gpu_id)
     net = model_util.to_inference_device(net, opt)
     net.eval()
     return net

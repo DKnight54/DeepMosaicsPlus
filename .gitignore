@@ -189,6 +189,18 @@ nohup.out
 *.exe
 *.npy
 *.psd
+# Local training data, checkpoints, and temp outputs
+datasets/
+checkpoints/
+pretrained_models/
+tmp/
+result/
+*.pth
+*.pt
+*.onnx
+*.safetensors
+*.bat
+tools/.dataset_prep_config.json
 
 
 ##############################cpp###################################

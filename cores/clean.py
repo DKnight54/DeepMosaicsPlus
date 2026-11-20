@@ -167,6 +167,49 @@ def select_netG_for_size_video(opt, netG, imagepaths, positions):
     except Exception as e:
         print(f"[auto_model] selection failed ({e}), keeping current model")
         return netG
+        
+def _group_detected_scenes(positions, min_size, max_gap_frames):
+    """Group frame indices with size > min_size into contiguous scene lists."""
+    hits = [i for i, (_x, _y, size) in enumerate(positions) if size > min_size]
+    if not hits:
+        return []
+    scenes = []
+    cur = [hits[0]]
+    for idx in hits[1:]:
+        if idx - cur[-1] <= max_gap_frames:
+            cur.append(idx)
+        else:
+            scenes.append(cur)
+            cur = [idx]
+    scenes.append(cur)
+    return scenes
+
+
+def select_netG_per_scene_video(opt, default_netG, imagepaths, positions, fps):
+    """Estimate mosaic block size per contiguous scene and map frame indices to (netG, input_size)."""
+    if not getattr(opt, 'auto_model', False) or opt.traditional:
+        return {}
+    min_size = getattr(opt, 'min_mosaic_size', 100)
+    scenes = _group_detected_scenes(positions, min_size, max(1, int(round(fps * 1.5))))
+    if len(scenes) <= 1:
+        return {}
+
+    default_size = int(getattr(opt, 'input_size', 256))
+    scene_map = {}
+    for s_idx, frame_idxs in enumerate(scenes):
+        sub_paths = [imagepaths[i] for i in frame_idxs if i < len(imagepaths)]
+        sub_pos = [positions[i] for i in frame_idxs if i < len(imagepaths)]
+        print(f"[auto_model] scene {s_idx + 1}/{len(scenes)} (frames {frame_idxs[0]}..{frame_idxs[-1]}):")
+        opt.input_size = default_size
+        chosen_netG = select_netG_for_size_video(opt, default_netG, sub_paths, sub_pos)
+        chosen_size = int(getattr(opt, 'input_size', default_size))
+        for i in range(frame_idxs[0], frame_idxs[-1] + 1):
+            scene_map[i] = (chosen_netG, chosen_size)
+
+    opt.input_size = default_size
+    return scene_map
+
+    
 def get_mosaic_positions(opt, netM, imagepaths, savemask=True):
     """Optimized mosaic position detection with batch processing and error handling"""
     device, device_type = setup_device(opt)
@@ -583,7 +626,9 @@ def cleanmosaic_video_fusion(opt, netG, netM):
     fps, imagepaths, height, width = video_init(opt, path)
     start_frame = int(imagepaths[0][7:13])
     positions = get_mosaic_positions(opt, netM, imagepaths, savemask=True)[(start_frame-1):]
-    netG = select_netG_for_size_video(opt, netG, imagepaths, positions)
+    scene_models = select_netG_per_scene_video(opt, netG, imagepaths, positions, fps)
+    if not scene_models:
+        netG = select_netG_for_size_video(opt, netG, imagepaths, positions)
     if int(getattr(opt, 'input_size', 256)) != INPUT_SIZE:
         # --auto_model picked a bucket model trained at a different size
         INPUT_SIZE = int(opt.input_size)
@@ -735,6 +780,15 @@ def cleanmosaic_video_fusion(opt, netG, netM):
                 pass
         
         # Process only if mosaic is large enough
+        if i in scene_models:
+            next_netG, next_size = scene_models[i]
+            if next_netG is not netG or next_size != INPUT_SIZE:
+                netG = next_netG
+                init_flag = True
+                if next_size != INPUT_SIZE:
+                    INPUT_SIZE = next_size
+                    input_stream_array = np.empty((1, T, INPUT_SIZE, INPUT_SIZE, 3), dtype=np.float32)
+                    temp_crop = np.empty((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
         if size > 50:
             try:
                 # Pre-calculate crop bounds to avoid repeated calculations

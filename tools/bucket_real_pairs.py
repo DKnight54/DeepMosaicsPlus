@@ -35,6 +35,7 @@ Usage:
 import os
 import sys
 
+
 # Windows consoles often default to a non-UTF-8 code page (cp1252/cp437),
 # which mangles Unicode characters like em-dashes into '?' or '�'. Force
 # UTF-8 stdout so any character in this script's output prints correctly
@@ -58,6 +59,7 @@ from util import mosaic as mosaic_util
 from util import ffmpeg as ffmpeg_util
 from util import util as util_
 from util import image_processing as impro
+from models.yolo_mosaic_detector import YoloMosaicDetector
 
 
 def find_pairs(censored_dir, uncensored_dir):
@@ -114,11 +116,34 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize, ex_range=(1.
         return None
     min_size = getattr(opt, 'min_mosaic_size', 100)
     pos = np.zeros((n, 3), dtype=np.int64)            # x, y, half-width of the detected box
-    for i, name in enumerate(tqdm(names, desc='  locating mosaic', leave=False)):
-        frame = impro.imread(os.path.join(mosaic_dir, name))
-        mask, x, y, size = runmodel.get_mosaic_position(frame, netM, opt)
-        if mask is not None and size > min_size:
-            pos[i] = (x, y, size)
+    
+    use_yolo_batch = isinstance(netM, YoloMosaicDetector) and hasattr(netM, 'detect_batch')
+    batch_size = 16
+
+    pbar_loc = tqdm(total=n, desc='  locating mosaic', leave=False)
+    for start_i in range(0, n, batch_size):
+        chunk_names = names[start_i:start_i + batch_size]
+        chunk_imgs = []
+        valid_indices = []
+
+        for offset, name in enumerate(chunk_names):
+            frame = impro.imread(os.path.join(mosaic_dir, name))
+            if frame is not None:
+                chunk_imgs.append(frame)
+                valid_indices.append(start_i + offset)
+
+        if chunk_imgs:
+            if use_yolo_batch:
+                dets = netM.detect_batch(chunk_imgs, opt)
+            else:
+                dets = [runmodel.get_mosaic_position(im, netM, opt) for im in chunk_imgs]
+
+            for idx, (mask, x, y, size) in zip(valid_indices, dets):
+                if mask is not None and size > min_size:
+                    pos[idx] = (x, y, size)
+
+        pbar_loc.update(len(chunk_names))
+    pbar_loc.close()
     valid = pos[:, 2] > 0
     if not valid.any():
         return None
@@ -135,7 +160,7 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize, ex_range=(1.
 
     ex_mul = random.uniform(*ex_range)               # same margin range as the synthetic builder
     sides, size_mismatch = [], False
-    for i, name in enumerate(names):
+    for i, name in enumerate(tqdm(names, desc='  Cropping Mosaic area', leave=False)):
         mosaic = impro.imread(os.path.join(mosaic_dir, name))
         origin = impro.imread(os.path.join(origin_dir, name))
         h, w = mosaic.shape[:2]
@@ -152,44 +177,150 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize, ex_range=(1.
         sides.append(2 * half)
     # drop frames that couldn't be paired: leaving them would put uncropped full frames in the dataset
     for d in (origin_dir, mosaic_dir):
-        for f in os.listdir(d):
+        for f in tqdm(os.listdir(d), desc=f'Disposing mismatch images'):
             if f.lower().endswith('.jpg') and f not in set(names):
                 os.remove(os.path.join(d, f))
     return {'frames': n, 'median_side': int(np.median(sides)), 'ex_mul': ex_mul,
             'enlarged_pct': 100.0 * float(np.mean(np.array(sides) < outsize)), 'resized_origin': size_mismatch}
 
 
-def extract_frames(videopath, out_dir, fps):
+def extract_frames(videopath, out_dir, fps, start_sec=None, duration_sec=None):
+    """Extract frames from `videopath` into `out_dir` (%05d.jpg).
+    If `start_sec` and `duration_sec` are provided, extracts only that scene window.
+    """
     util_.makedirs(out_dir)
-    ffmpeg_util.video2image(videopath, os.path.join(out_dir, '%05d.jpg'), fps=fps)
+    out_pattern = os.path.join(out_dir, '%05d.jpg')
+    if start_sec is not None and duration_sec is not None:
+        start_stamp = util_.second2stamp(int(start_sec))
+        last_stamp = util_.second2stamp(max(1, int(round(duration_sec))))
+        ffmpeg_util.video2image(
+            videopath,
+            out_pattern,
+            fps=fps,
+            start_time=start_stamp,
+            last_time=last_stamp,
+        )
+    else:
+        ffmpeg_util.video2image(videopath, out_pattern, fps=fps)
 
 
-def detect_pct(opt, netM, censored_video, n_samples, min_pct, max_pct):
+def detect_pct(opt, netM, censored_video, n_samples, min_pct, max_pct,
+               scan_stride_sec=2.0, max_gap_sec=5.0, min_scene_sec=3.0):
+    """Single-pass sequential scan using cap.grab().
+    Discovers continuous censored scenes and estimates mosaic block % per scene.
+    Returns a list of scene dicts:
+      [{'start': float, 'duration': float, 'pct': float,
+        'confidence': float, 'n_nonsquare': int, 'n_samples': int}, ...]
+    """
     cap = cv2.VideoCapture(censored_video)
     if not cap.isOpened():
-        return None
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total <= 0:
+        return []
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
         cap.release()
-        return None
-    idxs = sorted(set(int(i * total / n_samples) for i in range(n_samples)))
-    pairs = []
-    for idx in idxs:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        mask, x, y, size = runmodel.get_mosaic_position(frame, netM, opt)
-        if mask is None or size <= getattr(opt, 'min_mosaic_size', 100):
-            continue
-        pairs.append((frame, mask))
+        return []
+
+    step = max(1, int(round(fps * scan_stride_sec)))
+    min_size = getattr(opt, 'min_mosaic_size', 100)
+    min_conf = getattr(opt, 'auto_model_min_confidence', 0.15)
+    max_samples_per_scene = max(n_samples, 12)
+    use_yolo = isinstance(netM, YoloMosaicDetector)
+
+    hits = []  # list of (timestamp_sec, frame, mask)
+    frame_idx = 0
+
+    pbar = tqdm(total=total_frames, desc='  scanning video', unit='frame', leave=False)
+    while True:
+        if not cap.grab():
+            break
+
+        if frame_idx % step == 0:
+            ok, frame = cap.retrieve()
+            if ok and frame is not None:
+                orig_h, orig_w = frame.shape[:2]
+                max_side = max(orig_h, orig_w)
+
+                if use_yolo and max_side > 640:
+                    scale = 640.0 / max_side
+                    scan_frame = cv2.resize(
+                        frame,
+                        (int(round(orig_w * scale)), int(round(orig_h * scale))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    mask_small, x, y, size = netM.detect(scan_frame, opt)
+                    size = int(round(size / scale))
+                    if mask_small is not None and size > min_size:
+                        mask = cv2.resize(mask_small, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+                    else:
+                        mask = None
+                elif use_yolo:
+                    mask, x, y, size = netM.detect(frame, opt)
+                else:
+                    mask, x, y, size = runmodel.get_mosaic_position(frame, netM, opt)
+
+                if mask is not None and size > min_size:
+                    hits.append((frame_idx / fps, frame, mask))
+                    pbar.set_postfix(hits=len(hits), refresh=False)
+
+        frame_idx += 1
+        pbar.update(1)
+
+    pbar.close()
+
     cap.release()
-    if not pairs:
-        return None
-    result = mosaic_util.estimate_mosaic_block_pct_multi(
-        pairs, min_confidence=getattr(opt, 'auto_model_min_confidence', 0.15),
-        min_pct=min_pct, max_pct=max_pct)
-    return result
+    if not hits:
+        return []
+
+    # Group adjacent hits into continuous scenes
+    raw_scenes = []
+    cur = [hits[0]]
+    for item in hits[1:]:
+        if item[0] - cur[-1][0] <= max_gap_sec:
+            cur.append(item)
+        else:
+            raw_scenes.append(cur)
+            cur = [item]
+    raw_scenes.append(cur)
+
+    # Estimate mosaic block % individually for each scene
+    scenes = []
+    video_dur = total_frames / fps
+    for group in raw_scenes:
+        start_sec = max(0.0, group[0][0] - (scan_stride_sec * 0.5))
+        end_sec = min(video_dur, group[-1][0] + (scan_stride_sec * 0.5))
+        duration_sec = end_sec - start_sec
+
+        if duration_sec < min_scene_sec:
+            continue
+
+        if len(group) > max_samples_per_scene:
+            idxs = np.linspace(0, len(group) - 1, max_samples_per_scene, dtype=int)
+            sampled = [group[i] for i in idxs]
+        else:
+            sampled = group
+
+        pairs = [(f, m) for (_ts, f, m) in sampled]
+        res = mosaic_util.estimate_mosaic_block_pct_multi(
+            pairs,
+            min_confidence=min_conf,
+            min_pct=min_pct,
+            max_pct=max_pct,
+        )
+        if res is None:
+            continue
+
+        scenes.append({
+            'start': start_sec,
+            'duration': duration_sec,
+            'pct': res['pct'],
+            'confidence': res['confidence'],
+            'n_nonsquare': res.get('n_nonsquare', 0),
+            'n_samples': len(pairs),
+        })
+
+    return scenes
 
 
 def maybe_reuse_uncensored(pairs, mode, synthetic_source_dir):
@@ -254,6 +385,15 @@ def main():
              'from few distinct sources, since it multiplies content diversity per bucket without '
              'new source footage. \'ask\' (default) prompts once interactively; \'yes\'/\'no\' skip '
              'the prompt, useful for scripting.')
+             
+    parser.add_argument('--scan_stride_sec', type=float, default=2.0,
+                        help='seconds between sampled frames during scene discovery')
+    parser.add_argument('--max_gap_sec', type=float, default=5.0,
+                        help='max uncensored gap (seconds) before splitting into a new scene')
+    parser.add_argument('--min_scene_sec', type=float, default=3.0,
+                        help='minimum censored scene duration (seconds) to keep')
+    parser.add_argument('--yolo_conf', type=float, default=0.35,
+                        help='confidence threshold for YOLO mosaic detector (.pt/.onnx)')
     parser.add_argument('--synthetic_source_dir', default=os.path.join('datasets', 'raw', 'synthetic_source'))
     known, remaining = parser.parse_known_args()
 
@@ -266,6 +406,7 @@ def main():
         sys.argv += ['--model_path', sys.argv[pos_idx + 1], '--mode', 'clean', '--netG', 'unet_128']
 
     opt = Options().getparse(test_flag=True)
+    opt.yolo_conf = known.yolo_conf
 
     if not os.path.isdir(known.censored_dir):
         print(f"--censored_dir not found: {known.censored_dir}")
@@ -275,7 +416,10 @@ def main():
         sys.exit(1)
 
     print("Loading mosaic-position model...")
-    netM = loadmodel.bisenet(opt, 'mosaic')
+    if opt.mosaic_position_model_path.lower().endswith(('.pt', '.onnx')):
+        netM = YoloMosaicDetector(opt.mosaic_position_model_path, conf_thresh=0.35)
+    else:
+        netM = loadmodel.bisenet(opt, 'mosaic')
 
     manifest_path = opt.model_manifest
     if not os.path.exists(manifest_path):
@@ -297,49 +441,60 @@ def main():
     results = []
     for name, censored_path, uncensored_path in pairs:
         print(f"\n--- {name} ---")
-        result = detect_pct(opt, netM, censored_path, known.n_samples, min_pct, max_pct)
-        if result is None:
-            print(f"  Could not confidently detect mosaic size, skipping. "
-                  f"(Check the clip actually contains a detectable mosaic.)")
+        scenes = detect_pct(
+            opt, netM, censored_path, known.n_samples, min_pct, max_pct,
+            scan_stride_sec=known.scan_stride_sec,
+            max_gap_sec=known.max_gap_sec,
+            min_scene_sec=known.min_scene_sec,
+        )
+
+        if not scenes:
+            print("  Could not confidently detect any censored scenes, skipping.")
             continue
-        _, bucket = loadmodel.select_model_by_pct(result['pct'], manifest_path)
-        note = ""
-        if result['n_nonsquare'] > 0:
-            note = f"  ({result['n_nonsquare']}/{result['n_samples']} samples non-square)"
-        print(f"  detected pct={result['pct']:.2f}%  confidence={result['confidence']:.2f}{note}  -> bucket {bucket:g}%")
+            
+            
+        print(f"  Found {len(scenes)} censored scene(s).")
+        for scene_idx, sc in enumerate(scenes):
+            _, bucket = loadmodel.select_model_by_pct(sc['pct'], manifest_path)
+            clip_name = f"{name}_scene{scene_idx:03d}"
 
-        bucket_dir = os.path.join(known.output_dir, f'bucket_{bucket:g}', name)
-        origin_dir = os.path.join(bucket_dir, 'origin_image')
-        mosaic_dir = os.path.join(bucket_dir, 'mosaic_image')
-        print(f"  extracting frames -> {bucket_dir}")
-        extract_frames(uncensored_path, origin_dir, known.fps)
-        extract_frames(censored_path, mosaic_dir, known.fps)
+            note = ""
+            if sc ['n_nonsquare'] > 0:
+                note = f"  ({sc ['n_nonsquare']}/{sc ['n_samples']} samples non-square)"
+            print(f"  detected pct={sc ['pct']:.2f}%  confidence={sc ['confidence']:.2f}{note}  -> bucket {bucket:g}%")
 
-        n_orig = len(os.listdir(origin_dir))
-        n_mosaic = len(os.listdir(mosaic_dir))
-        if n_orig != n_mosaic:
-            print(f"  ** WARNING: frame count mismatch (origin={n_orig}, mosaic={n_mosaic}) — "
-                  f"the two source videos may differ in length/framerate. This pair's alignment "
-                  f"is suspect; recommend checking manually before training on it. **")
+            bucket_dir = os.path.join(known.output_dir, f'bucket_{bucket:g}', clip_name)
+            origin_dir = os.path.join(bucket_dir, 'origin_image')
+            mosaic_dir = os.path.join(bucket_dir, 'mosaic_image')
+            print(f"  extracting frames -> {bucket_dir}")
+            extract_frames(uncensored_path, origin_dir, known.fps, start_sec=sc['start'], duration_sec=sc['duration'])
+            extract_frames(censored_path, mosaic_dir, known.fps, start_sec=sc['start'], duration_sec=sc['duration'])
 
-        if not known.no_crop:
-            stats = crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, known.outsize)
-            if stats is None:
-                print("  could not locate the mosaic in this pair's frames -- skipping it")
-                shutil.rmtree(bucket_dir, ignore_errors=True)
-                continue
-            print(f"  cropped {stats['frames']} frame pairs to the mosaic region: median source crop "
-                  f"{stats['median_side']}px -> {known.outsize}px ({stats['enlarged_pct']:.0f}% enlarged)")
-            if stats['resized_origin']:
-                print("  note: the uncensored video has a different resolution than the censored one; "
-                      "it was resized to match before cropping.")
+            n_orig = len(os.listdir(origin_dir))
+            n_mosaic = len(os.listdir(mosaic_dir))
+            if n_orig != n_mosaic:
+                print(f"  ** WARNING: frame count mismatch (origin={n_orig}, mosaic={n_mosaic}) — "
+                      f"the two source videos may differ in length/framerate. This pair's alignment "
+                      f"is suspect; recommend checking manually before training on it. **")
 
-        results.append((name, result['pct'], bucket))
+            if not known.no_crop:
+                stats = crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, known.outsize)
+                if stats is None:
+                    print("  could not locate the mosaic in this pair's frames -- skipping it")
+                    shutil.rmtree(bucket_dir, ignore_errors=True)
+                    continue
+                print(f"  cropped {stats['frames']} frame pairs to the mosaic region: median source crop "
+                      f"{stats['median_side']}px -> {known.outsize}px ({stats['enlarged_pct']:.0f}% enlarged)")
+                if stats['resized_origin']:
+                    print("  note: the uncensored video has a different resolution than the censored one; "
+                          "it was resized to match before cropping.")
+
+            results.append((clip_name, sc ['pct'], bucket))
 
     print("\n=== Summary ===")
     for name, pct, bucket in results:
         print(f"  {name}: {pct:.2f}% -> bucket {bucket:g}%")
-    print(f"\nDone. {len(results)}/{len(pairs)} pairs bucketed under {known.output_dir}/bucket_<N>/")
+    print(f"\nDone. {len(results)} scene(s) from {len(pairs)} pair(s) bucketed under {known.output_dir}/bucket_<N>/")
     print("Recommended next step: spot-check a few frame pairs in each bucket folder for alignment "
           "before training (see this script's docstring).")
 

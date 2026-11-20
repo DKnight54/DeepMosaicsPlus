@@ -295,7 +295,7 @@ def video2image(videopath, imagepath, fps=0, start_time='00:00:00', last_time='0
         _video2image_once(videopath, imagepath, fps, start_time, last_time, qv, use_hw=False)
 
 def _video2image_once(videopath, imagepath, fps, start_time, last_time, qv, use_hw):
-    args = ['ffmpeg', '-y']
+    args = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error']
     if use_hw and hwaccel is not None:
         args += ['-hwaccel', hwaccel]
     if last_time != '00:00:00':
