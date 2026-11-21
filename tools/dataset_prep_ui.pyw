@@ -53,6 +53,10 @@ DEFAULTS = {
     'roi_model_path': os.path.join(ROOT, 'pretrained_models', 'mosaic', 'add_face.pth'),
     'fps': 24,
     'reuse_uncensored': True,
+    'real_pairs_workers': 2,
+    'real_pairs_no_resume': False,
+    'synth_workers': 2,
+    'synth_no_resume': False,
     'gpu_id': '0',
     'batchsize': 8,
     'n_epoch': 200,
@@ -493,19 +497,38 @@ class DatasetPrepWindow(QMainWindow):
         # -- 1 real pairs
         c1 = StepCard(1, "Real pairs", "Cuts your censored / uncensored pairs to the mosaic area and sorts them into "
                       "buckets by mosaic size.", self._run_single)
+        self.workers_spin = QSpinBox()
+        self.workers_spin.setRange(1, 6)
+        c1.body.addLayout(field("Workers", self.workers_spin,
+                                "Parallel worker threads for FFmpeg extraction & cropping.\n"
+                                "2-3 keeps NVENC busy without overheating."))
         self.reuse_check = QCheckBox("Also use the uncensored clips as clean footage for step 2")
-        c1.body.addWidget(self.reuse_check); c1.body.addStretch()
+        c1.body.addWidget(self.reuse_check)
+        self.no_resume_check = QCheckBox("Reprocess all (ignore resume)")
+        self.no_resume_check.setToolTip("Already-completed video pairs are skipped by default. "
+                                        "Tick this to wipe and re-extract every pair from scratch.")
+        c1.body.addWidget(self.no_resume_check)
+        c1.body.addStretch()
         self.cards.append(c1); col.addWidget(c1)
 
         # -- 2 synthetic pool
         c2 = StepCard(2, "Synthetic pool from clean footage", "Finds areas to censor in your clean footage with the ROI "
                       "model and stores them as clips. Training adds the mosaic itself.", self._run_single)
+        self.synth_workers_spin = QSpinBox()
+        self.synth_workers_spin.setRange(1, 6)
+        c2.body.addLayout(field("Workers", self.synth_workers_spin,
+                                "Parallel worker threads for FFmpeg extraction & cropping.\n"
+                                "2-3 keeps NVENC saturated without overheating."))
         self.scene_accept_spin = QDoubleSpinBox()
         self.scene_accept_spin.setRange(0.1, 1.0); self.scene_accept_spin.setSingleStep(0.1); self.scene_accept_spin.setDecimals(2)
         c2.body.addLayout(field("Scene acceptance", self.scene_accept_spin,
                                 "Share of the sampled frames in a scene that must pass ROI detection for the scene to be kept.\n"
                                 "1.0 = all of them (strict: one weak frame discards the scene).\n"
                                 "Try 0.5-0.6 if you get few clips from plenty of footage."))
+        self.synth_no_resume_check = QCheckBox("Reprocess all")
+        self.synth_no_resume_check.setToolTip("Already-scanned clean videos are skipped by default. "
+                                              "Tick this to re-scan all source videos from scratch.")
+        c2.body.addWidget(self.synth_no_resume_check)
         self.extra_dataset_edit = QLineEdit(); self.extra_dataset_edit.setPlaceholderText("optional")
         c2.body.addLayout(field("Extra arguments", self.extra_dataset_edit, "Passed to make_datasets/make_video_dataset.py as typed."), stretch=1)
         self.cards.append(c2); col.addWidget(c2)
@@ -770,6 +793,10 @@ class DatasetPrepWindow(QMainWindow):
             self._update_path_mark(key)
         self.fps_spin.setValue(self.cfg.get('fps', 24))
         self.reuse_check.setChecked(self.cfg.get('reuse_uncensored', True))
+        self.workers_spin.setValue(int(self.cfg.get('real_pairs_workers', 2)))
+        self.no_resume_check.setChecked(bool(self.cfg.get('real_pairs_no_resume', False)))
+        self.synth_workers_spin.setValue(int(self.cfg.get('synth_workers', 2)))
+        self.synth_no_resume_check.setChecked(bool(self.cfg.get('synth_no_resume', False)))
         self.gpu_edit.setText(str(self.cfg.get('gpu_id', '0')))
         self.batchsize_spin.setValue(self.cfg.get('batchsize', 8))
         self.epoch_spin.setValue(self.cfg.get('n_epoch', 200))
@@ -797,6 +824,10 @@ class DatasetPrepWindow(QMainWindow):
             self.cfg[key] = edit.text().strip()
         self.cfg['fps'] = self.fps_spin.value()
         self.cfg['reuse_uncensored'] = self.reuse_check.isChecked()
+        self.cfg['real_pairs_workers'] = self.workers_spin.value()
+        self.cfg['real_pairs_no_resume'] = self.no_resume_check.isChecked()
+        self.cfg['synth_workers'] = self.synth_workers_spin.value()
+        self.cfg['synth_no_resume'] = self.synth_no_resume_check.isChecked()
         self.cfg['gpu_id'] = self.gpu_edit.text().strip() or '0'
         self.cfg['batchsize'] = self.batchsize_spin.value()
         self.cfg['n_epoch'] = self.epoch_spin.value()
@@ -902,18 +933,53 @@ class DatasetPrepWindow(QMainWindow):
         self.log.appendPlainText(text)
 
     def _show_line(self, line, final):
-        """Show the current output line. A line that hasn't ended yet (a progress bar
-        that is still updating) is shown straight away and replaced in place by its
-        next update, like in a terminal -- instead of staying hidden until it ends,
-        which made a finished bar look stuck while the next one was already running."""
+        """Render final lines cleanly and replace live \\r lines in-place without
+        leaving empty paragraph blocks in QPlainTextEdit."""
+        if line.startswith('@@PROGRESS|'):
+            self._handle_gui_progress(line)
+            return
+
+        cur = self.log.textCursor()
+        cur.movePosition(QTextCursor.MoveOperation.End)
         if self._live:
-            cur = self.log.textCursor()
-            cur.movePosition(QTextCursor.MoveOperation.End)
-            cur.select(QTextCursor.SelectionType.BlockUnderCursor)
-            cur.removeSelectedText()
-        self.log.appendPlainText(line)
+            cur.movePosition(QTextCursor.MoveOperation.StartOfBlock, QTextCursor.MoveMode.KeepAnchor)
+            cur.insertText(line)
+        else:
+            if self.log.document().characterCount() > 1:
+                cur.insertText('\n' + line)
+            else:
+                cur.insertText(line)
+        self.log.setTextCursor(cur)
+        self.log.ensureCursorVisible()
         self._live = not final
         self._parse_progress(line)
+
+    def _handle_gui_progress(self, line):
+        """Parse @@PROGRESS|done=X|total=Y|active=...|msg=... lines cleanly."""
+        parts = {}
+        for chunk in line[len('@@PROGRESS|'):].split('|'):
+            if '=' in chunk:
+                k, v = chunk.split('=', 1)
+                parts[k] = v
+        try:
+            done = int(parts.get('done', 0))
+            total = int(parts.get('total', 0))
+            if total > 0:
+                pct = int(round(100.0 * done / total))
+                self.progress.setRange(0, 100)
+                self.progress.setValue(max(0, min(100, pct)))
+                self._last_pct = pct
+                active = parts.get('active', '')
+                msg = parts.get('msg', '')
+                sub = f"{done}/{total}"
+                if active and active != 'idle':
+                    sub += f" · active: {active}"
+                elif msg:
+                    sub += f" · {msg}"
+                self._sub = sub
+                self._tick()
+        except Exception:
+            pass
 
     def _emit_line(self, line, replace=False):
         self._show_line(line, True)
@@ -921,15 +987,17 @@ class DatasetPrepWindow(QMainWindow):
     def _feed(self, text):
         for part in re.split(r'(\r\n|\n|\r)', text):
             if part in ('\n', '\r\n'):
-                self._show_line(self._partial, True)
+                if self._partial or self._live:
+                    self._show_line(self._partial, True)
                 self._partial, self._cr = '', False
             elif part == '\r':
-                self._cr = True                     # what follows overwrites this line
+                self._cr = True
             elif part:
                 if self._cr:
                     self._partial, self._cr = '', False
                 self._partial += part
                 self._show_line(self._partial, False)
+
 
     def _parse_progress(self, line):
         m = re.search(r'=== Bucket ([\d.]+)% ===', line)
@@ -1121,16 +1189,21 @@ class DatasetPrepWindow(QMainWindow):
                 raise ValueError("the mosaic position model is not set or not found")
             if not os.path.exists(cfg['model_manifest']):
                 raise ValueError("the size manifest was not found")
-            return [py, os.path.join(ROOT, 'tools', 'bucket_real_pairs.py'),
-                    '--censored_dir', cfg['censored_dir'],
-                    '--uncensored_dir', cfg['uncensored_dir'],
-                    '--output_dir', cfg['real_pairs_dir'],
-                    '--mosaic_position_model_path', cfg['mosaic_position_model_path'],
-                    '--model_manifest', cfg['model_manifest'],
-                    '--fps', str(cfg['fps']),
-                    '--reuse_uncensored_for_synthetic', 'yes' if cfg['reuse_uncensored'] else 'no',
-                    '--synthetic_source_dir', cfg['synthetic_source_dir'],
-                    '--outsize', outsize], ROOT
+            cmd = [py, os.path.join(ROOT, 'tools', 'bucket_real_pairs.py'),
+                   '--censored_dir', cfg['censored_dir'],
+                   '--uncensored_dir', cfg['uncensored_dir'],
+                   '--output_dir', cfg['real_pairs_dir'],
+                   '--mosaic_position_model_path', cfg['mosaic_position_model_path'],
+                   '--model_manifest', cfg['model_manifest'],
+                   '--fps', str(cfg['fps']),
+                   '--reuse_uncensored_for_synthetic', 'yes' if cfg['reuse_uncensored'] else 'no',
+                   '--synthetic_source_dir', cfg['synthetic_source_dir'],
+                   '--outsize', outsize,
+                   '--workers', str(cfg.get('real_pairs_workers', 2)),
+                   '--gui_progress']
+            if cfg.get('real_pairs_no_resume'):
+                cmd.append('--no_resume')
+            return cmd, ROOT
         if index == 1:
             if not os.path.exists(cfg['roi_model_path']):
                 raise ValueError(f"the ROI model was not found at {cfg['roi_model_path']}")
@@ -1140,7 +1213,11 @@ class DatasetPrepWindow(QMainWindow):
                    '--model_path', cfg['roi_model_path'],
                    '--fps', str(cfg['fps']),
                    '--scene_accept_ratio', str(cfg['scene_accept_ratio']),
-                   '--outsize', outsize]
+                   '--outsize', outsize,
+                   '--workers', str(cfg.get('synth_workers', 2)),
+                   '--gui_progress']
+            if cfg.get('synth_no_resume'):
+                cmd.append('--no_resume')
             return cmd + cfg['extra_dataset_args'].split(), os.path.join(ROOT, 'make_datasets')
         if index == 2:
             cmd = [py, os.path.join(ROOT, 'tools', 'make_generated_dataset.py'),
