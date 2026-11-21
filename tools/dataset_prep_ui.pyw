@@ -210,12 +210,18 @@ def ffprobe_info(path):
     try:
         cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json',
                '-show_format', '-show_streams', '-i', path]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 stdin=subprocess.DEVNULL, timeout=15)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            timeout=15,
+            creationflags=0x08000000 if os.name == 'nt' else 0,
+        )
         if result.returncode != 0:
             return None, None
         infos = json.loads(result.stdout.decode('utf-8', errors='replace'))
-        stream = infos['streams'][0]
+        stream = infos['streams']
         fps_str = stream.get('avg_frame_rate') or stream.get('r_frame_rate') or '0/1'
         num, _, den = fps_str.partition('/')
         fps = float(num) / float(den or 1) if float(den or 1) else 0

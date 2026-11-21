@@ -186,28 +186,60 @@ def _group_detected_scenes(positions, min_size, max_gap_frames):
 
 
 def select_netG_per_scene_video(opt, default_netG, imagepaths, positions, fps):
-    """Estimate mosaic block size per contiguous scene and map frame indices to (netG, input_size)."""
+    """Group contiguous mosaic scenes, absorb short bursts (< 1.0s) into the adjacent scene
+    so block-size estimation samples across the full combined stretch, and map frame indices
+    to (netG, input_size)."""
     if not getattr(opt, 'auto_model', False) or opt.traditional:
         return {}
     min_size = getattr(opt, 'min_mosaic_size', 100)
-    scenes = _group_detected_scenes(positions, min_size, max(1, int(round(fps * 1.5))))
+    raw_scenes = _group_detected_scenes(positions, min_size, max(1, int(round(fps * 1.5))))
+    if len(raw_scenes) <= 1:
+        return {}
+
+    min_hold_frames = max(15, int(round(fps * 1.0)))
+
+    # Merge short bursts (< min_hold_frames) into the preceding (or following) scene first
+    # so select_netG_for_size_video samples across the combined frame range
+    scenes = []
+    pending_short = []
+    for frame_idxs in raw_scenes:
+        if len(frame_idxs) < min_hold_frames:
+            if scenes:
+                scenes[-1].extend(frame_idxs)
+            else:
+                pending_short.extend(frame_idxs)
+        else:
+            if pending_short:
+                frame_idxs = pending_short + frame_idxs
+                pending_short = []
+            scenes.append(list(frame_idxs))
+    if pending_short:
+        if scenes:
+            scenes[-1].extend(pending_short)
+        else:
+            scenes.append(pending_short)
+
     if len(scenes) <= 1:
         return {}
 
     default_size = int(getattr(opt, 'input_size', 256))
+    active_netG = default_netG
     scene_map = {}
+
     for s_idx, frame_idxs in enumerate(scenes):
         sub_paths = [imagepaths[i] for i in frame_idxs if i < len(imagepaths)]
         sub_pos = [positions[i] for i in frame_idxs if i < len(imagepaths)]
         print(f"[auto_model] scene {s_idx + 1}/{len(scenes)} (frames {frame_idxs[0]}..{frame_idxs[-1]}):")
         opt.input_size = default_size
-        chosen_netG = select_netG_for_size_video(opt, default_netG, sub_paths, sub_pos)
+        chosen_netG = select_netG_for_size_video(opt, active_netG, sub_paths, sub_pos)
         chosen_size = int(getattr(opt, 'input_size', default_size))
+        active_netG = chosen_netG
         for i in range(frame_idxs[0], frame_idxs[-1] + 1):
             scene_map[i] = (chosen_netG, chosen_size)
 
     opt.input_size = default_size
     return scene_map
+
 
     
 def get_mosaic_positions(opt, netM, imagepaths, savemask=True):
