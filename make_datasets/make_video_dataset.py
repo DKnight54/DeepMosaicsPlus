@@ -244,7 +244,7 @@ def _process_one_video(videopath):
 
             imagepaths = sorted(util.Traversal(worker_tmp))
             imgs, masks = [], []
-            ex_mul = random.uniform(1.2, 1.7)
+            ex_mul = random.uniform(1.35, 1.85)
             positions = []
             for imagepath in imagepaths:
                 img = impro.imread(imagepath)
@@ -271,6 +271,9 @@ def _process_one_video(videopath):
                 positions[:, c] = filt.medfilt(positions[:, c], opt.medfilt_num)
 
             cropped_pairs = []
+            k_pad = random.randrange(15, 37, 2)
+            pad_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_pad, k_pad))
+            mh = max(16, int(0.10 * opt.outsize))
             for i in range(len(imgs)):
                 x, y, size = positions[i][0], positions[i][1], positions[i][2]
                 tmp_cnt = i
@@ -291,6 +294,10 @@ def _process_one_video(videopath):
                 local_sides.append(min(y1 - y0, x1 - x0))
                 img_out = impro.resize(imgs[i][y0:y1, x0:x1], opt.outsize, interpolation=cv2.INTER_CUBIC)
                 mask_out = impro.resize(masks[i][y0:y1, x0:x1], opt.outsize, interpolation=cv2.INTER_CUBIC)
+                dilated = cv2.dilate(mask_out, pad_kernel, iterations=1)
+                safe = np.zeros_like(dilated)
+                safe[mh:opt.outsize - mh, mh:opt.outsize - mh] = dilated[mh:opt.outsize - mh, mh:opt.outsize - mh]
+                mask_out = np.maximum(mask_out, safe)
                 cropped_pairs.append((img_out, mask_out))
 
             min_keep = min(SUB_MIN_FRAMES, max(1, int(opt.time * opt.fps * 0.8)))
