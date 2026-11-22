@@ -47,6 +47,7 @@ from util import ffmpeg as ffmpeg_util
 from util import util as util_
 from util import image_processing as impro
 from models.yolo_mosaic_detector import YoloMosaicDetector
+from tools.filter_subtitled_scenes import has_subtitle_in_pair, split_clean_runs, MIN_FRAMES as SUB_MIN_FRAMES
 
 
 def find_pairs(censored_dir, uncensored_dir):
@@ -176,6 +177,48 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
         'resized_origin': size_mismatch,
     }
 
+def _split_subtitles_in_place(bucket_dir, min_frames=SUB_MIN_FRAMES):
+    """Split a newly cropped pair folder into _sub0, _sub1... if burned-in subtitles are detected."""
+    orig_dir = os.path.join(bucket_dir, 'origin_image')
+    mos_dir = os.path.join(bucket_dir, 'mosaic_image')
+    names = sorted(f for f in os.listdir(orig_dir) if f.lower().endswith('.jpg'))
+    n = len(names)
+    if n < min_frames:
+        return 0
+
+    raw = []
+    for fn in names:
+        oi = cv2.imread(os.path.join(orig_dir, fn))
+        mi = cv2.imread(os.path.join(mos_dir, fn))
+        raw.append(True if (oi is None or mi is None) else has_subtitle_in_pair(oi, mi))
+
+    flags = [False] * n
+    i = 0
+    while i < n:
+        if raw[i]:
+            j = i
+            while j < n and raw[j]:
+                j += 1
+            if (j - i) >= 5:
+                for k in range(max(0, i - 2), min(n, j + 2)):
+                    flags[k] = True
+            i = j
+        else:
+            i += 1
+
+    if sum(flags) == 0:
+        return 1
+
+    runs = split_clean_runs(flags, min_frames)
+    for r_idx, (s_i, e_i) in enumerate(runs):
+        sub_dir = f"{bucket_dir}_sub{r_idx}"
+        os.makedirs(os.path.join(sub_dir, 'origin_image'), exist_ok=True)
+        os.makedirs(os.path.join(sub_dir, 'mosaic_image'), exist_ok=True)
+        for out_i, src_i in enumerate(range(s_i, e_i), start=1):
+            shutil.copy2(os.path.join(orig_dir, names[src_i]), os.path.join(sub_dir, 'origin_image', f"{out_i:05d}.jpg"))
+            shutil.copy2(os.path.join(mos_dir, names[src_i]), os.path.join(sub_dir, 'mosaic_image', f"{out_i:05d}.jpg"))
+    shutil.rmtree(bucket_dir, ignore_errors=True)
+    return len(runs)
 
 def extract_frames(videopath, out_dir, fps, start_sec=None, duration_sec=None):
     """Extract frames from `videopath` into `out_dir` (%05d.jpg)."""
@@ -197,61 +240,7 @@ def extract_frames(videopath, out_dir, fps, start_sec=None, duration_sec=None):
 
 def detect_pct(opt, netM, censored_video, n_samples, min_pct, max_pct,
                scan_stride_sec=2.0, max_gap_sec=5.0, min_scene_sec=3.0,
-               gpu_lock=None, show_pbar=True):
-    """Single-pass sequential scan using cap.grab().
-    Discovers continuous censored scenes and estimates mosaic block % per scene.
-    """
-    cap = cv2.VideoCapture(censored_video)
-    if not cap.isOpened():
-        return []
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames <= 0:
-        cap.release()
-        return []
-
-    step = max(1, int(round(fps * scan_stride_sec)))
-    min_size = getattr(opt, 'min_mosaic_size', 100)
-    min_conf = getattr(opt, 'auto_model_min_confidence', 0.15)
-    max_samples_per_scene = max(n_samples, 12)
-    use_yolo = isinstance(netM, YoloMosaicDetector)
-
-    hits = []
-    frame_idx = 0
-
-    pbar = tqdm(total=total_frames, desc='  scanning video', unit='frame', leave=False, disable=not show_pbar)
-    while True:
-        if not cap.grab():
-            break
-
-        if frame_idx % step == 0:
-            ok, frame = cap.retrieve()
-            if ok and frame is not None:
-                orig_h, orig_w = frame.shape[:2]
-                max_side = max(orig_h, orig_w)
-
-                if use_yolo and max_side > 640:
-                    scale = 640.0 / max_side
-                    scan_frame = cv2.resize(
-                        frame,
-                        (int(round(orig_w * scale)), int(round(orig_h * scale))),
-                        interpolation=cv2.INTER_AREA,
-                    )
-                    if gpu_lock is not None:
-                        with gpu_lock:
-                            mask_small, x, y, size = netM.detect(scan_frame, opt)
-                    else:
-                        mask_small, x, y, size = netM.detect(scan_frame, opt)
-                    size = int(round(size / scale))
-                    if mask_small is not None and size > min_size:
-                        mask = cv2.resize(mask_small, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-
-
-
-def detect_pct(opt, netM, censored_video, n_samples, min_pct, max_pct,
-               scan_stride_sec=2.0, max_gap_sec=5.0, min_scene_sec=3.0,
-               gpu_lock=None, show_pbar=True):
+               gpu_lock=None, show_pbar=True, progress_cb=None):
     """Single-pass sequential scan using cap.grab().
     Discovers continuous censored scenes and estimates mosaic block % per scene.
     Returns a list of scene dicts:
@@ -325,6 +314,8 @@ def detect_pct(opt, netM, censored_video, n_samples, min_pct, max_pct,
 
         frame_idx += 1
         pbar.update(1)
+        if progress_cb is not None and (frame_idx % (step * 5) == 0):
+            progress_cb(int(100 * frame_idx / max(1, total_frames)))
 
     pbar.close()
     cap.release()
@@ -552,7 +543,8 @@ def main():
 
     gpu_lock = threading.Lock()
     state_lock = threading.Lock()
-    active_names = set()
+    slot_pool = list(range(workers))
+    worker_slots = {}  # slot_idx -> "W1: name [stage]@pct"
     completed_pairs = 0
     total_todo = len(todo_pairs)
     results = []
@@ -561,9 +553,16 @@ def main():
         if not use_gui:
             return
         with state_lock:
-            act = ", ".join(sorted(active_names)) if active_names else "idle"
+            w_str = ";".join(worker_slots[k] for k in sorted(worker_slots))
             done_n = completed_pairs
-        print(f"@@PROGRESS|done={done_n}|total={total_todo}|active={act}|msg={msg}", flush=True)
+        print(f"@@PROGRESS|done={done_n}|total={total_todo}|workers={w_str}|msg={msg}", flush=True)
+
+    def set_worker_status(slot, name, stage, pct=None):
+        short = name if len(name) <= 22 else name[:19] + "..."
+        pct_part = f"@{pct}" if pct is not None else "@"
+        with state_lock:
+            worker_slots[slot] = f"W{slot + 1}: {short} [{stage}]{pct_part}"
+        emit_gui_progress()
 
     def process_one_pair(pair_tuple):
         nonlocal completed_pairs
@@ -571,8 +570,8 @@ def main():
         t0 = time.time()
 
         with state_lock:
-            active_names.add(name)
-        emit_gui_progress(f"scanning {name}")
+            slot = slot_pool.pop(0)
+        set_worker_status(slot, name, "scan", 0)
 
         pair_logs = []
         pair_results = []
@@ -584,6 +583,7 @@ def main():
                 min_scene_sec=known.min_scene_sec,
                 gpu_lock=gpu_lock,
                 show_pbar=show_inner_pbar,
+                progress_cb=lambda p: set_worker_status(slot, name, "scan", p),
             )
 
             if not scenes:
@@ -595,6 +595,7 @@ def main():
                     if est_frames < known.min_frames:
                         continue
 
+                    set_worker_status(slot, name, f"scene {scene_idx + 1}/{len(scenes)}")
                     _, bucket = loadmodel.select_model_by_pct(sc['pct'], manifest_path)
                     clip_name = f"{name}_scene{scene_idx:03d}"
                     bucket_dir = os.path.join(known.output_dir, f'bucket_{bucket:g}', clip_name)
@@ -622,9 +623,13 @@ def main():
                         if stats is None:
                             shutil.rmtree(bucket_dir, ignore_errors=True)
                             continue
+                        n_clean_clips = _split_subtitles_in_place(bucket_dir, min_frames=known.min_frames)
+                        if n_clean_clips == 0:
+                            continue
+                        sub_note = f" -> {n_clean_clips} clean sub-clip(s)" if n_clean_clips > 1 else ""
                         pair_logs.append(
                             f"    scene {scene_idx:03d}: pct={sc['pct']:.2f}% (conf={sc['confidence']:.2f}) "
-                            f"-> bucket {bucket:g}% | {stats['frames']} frames, median {stats['median_side']}px{warn}"
+                            f"-> bucket {bucket:g}% | {stats['frames']} frames, median {stats['median_side']}px{warn}{sub_note}"
                         )
                     else:
                         pair_logs.append(
@@ -644,7 +649,9 @@ def main():
         finally:
             dt = time.time() - t0
             with state_lock:
-                active_names.discard(name)
+                worker_slots.pop(slot, None)
+                slot_pool.append(slot)
+                slot_pool.sort()
                 completed_pairs += 1
                 idx_now = completed_pairs
                 results.extend(pair_results)

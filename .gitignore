@@ -201,6 +201,8 @@ result/
 *.safetensors
 *.bat
 tools/.dataset_prep_config.json
+PROJECT_CONTEXT.md
+
 
 
 ##############################cpp###################################

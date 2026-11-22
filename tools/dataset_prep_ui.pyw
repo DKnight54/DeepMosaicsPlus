@@ -436,6 +436,13 @@ class DatasetPrepWindow(QMainWindow):
         side_l.addWidget(self.progress)
         self.run_detail = dim("Nothing is running. Tick the steps you want on the Workflow tab and press Run.")
         side_l.addWidget(self.run_detail)
+        self.worker_box = QWidget()
+        self.worker_layout = QVBoxLayout(self.worker_box)
+        self.worker_layout.setContentsMargins(0, 2, 0, 2)
+        self.worker_layout.setSpacing(4)
+        self.worker_box.setVisible(False)
+        self._worker_rows = []
+        side_l.addWidget(self.worker_box)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setFont(QFont("Consolas" if sys.platform == 'win32' else "Monospace", 9))
@@ -933,13 +940,17 @@ class DatasetPrepWindow(QMainWindow):
         self.log.appendPlainText(text)
 
     def _show_line(self, line, final):
-        """Render final lines cleanly and replace live \\r lines in-place without
-        leaving empty paragraph blocks in QPlainTextEdit."""
+        """Render final lines cleanly without clobbering mouse selection or spamming makedir."""
         if line.startswith('@@PROGRESS|'):
             self._handle_gui_progress(line)
             return
+        if line.startswith('makedir:'):
+            return
 
-        cur = self.log.textCursor()
+        sb = self.log.verticalScrollBar()
+        at_bottom = sb.value() >= (sb.maximum() - 20)
+
+        cur = QTextCursor(self.log.document())
         cur.movePosition(QTextCursor.MoveOperation.End)
         if self._live:
             cur.movePosition(QTextCursor.MoveOperation.StartOfBlock, QTextCursor.MoveMode.KeepAnchor)
@@ -949,10 +960,35 @@ class DatasetPrepWindow(QMainWindow):
                 cur.insertText('\n' + line)
             else:
                 cur.insertText(line)
-        self.log.setTextCursor(cur)
-        self.log.ensureCursorVisible()
+
+        if at_bottom:
+            sb.setValue(sb.maximum())
         self._live = not final
         self._parse_progress(line)
+
+    def _update_worker_bars(self, workers_str):
+        entries = [w for w in workers_str.split(';') if w.strip()] if workers_str else []
+        self.worker_box.setVisible(bool(entries))
+        while len(self._worker_rows) < len(entries):
+            row_w = QWidget()
+            rl = QHBoxLayout(row_w)
+            rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(8)
+            lbl = QLabel(""); lbl.setObjectName("dim"); lbl.setFixedWidth(220)
+            bar = QProgressBar(); bar.setTextVisible(False); bar.setRange(0, 100)
+            rl.addWidget(lbl); rl.addWidget(bar, stretch=1)
+            self.worker_layout.addWidget(row_w)
+            self._worker_rows.append((row_w, lbl, bar))
+        for i, (row_w, lbl, bar) in enumerate(self._worker_rows):
+            if i < len(entries):
+                name, _, pct_s = entries[i].rpartition('@')
+                pct = int(pct_s) if pct_s.isdigit() else 0
+                lbl.setText(name)
+                lbl.setToolTip(name)
+                bar.setRange(0, 100 if pct_s.isdigit() else 0)
+                bar.setValue(max(0, min(100, pct)))
+                row_w.setVisible(True)
+            else:
+                row_w.setVisible(False)
 
     def _handle_gui_progress(self, line):
         """Parse @@PROGRESS|done=X|total=Y|active=...|msg=... lines cleanly."""
@@ -977,6 +1013,7 @@ class DatasetPrepWindow(QMainWindow):
                 elif msg:
                     sub += f" · {msg}"
                 self._sub = sub
+                self._update_worker_bars(parts.get('workers', ''))
                 self._tick()
         except Exception:
             pass
@@ -1316,6 +1353,7 @@ class DatasetPrepWindow(QMainWindow):
             self.run_all_btn.setEnabled(False)
 
     def _next_step(self):
+        
         if not self._queue:
             took = self._fmt(time.time() - self._run_started)
             self.run_title.setText("Finished")
@@ -1332,6 +1370,7 @@ class DatasetPrepWindow(QMainWindow):
         self._sub = ''
         self._last_pct = None
         self._step_started = time.time()
+        self._update_worker_bars('')
         self.cards[index].set_state('running', 'running…')
         self.progress.setRange(0, 0)       # busy until the step reports progress
         self._log(f"\n=== Step {index + 1}: {self.STEP_NAMES[index]} ===\n$ {' '.join(cmd)}\n")
@@ -1358,6 +1397,7 @@ class DatasetPrepWindow(QMainWindow):
             self._on_finished(-1, None)
 
     def _on_finished(self, code, _status):
+        
         if self._current is None:
             return
         index, self._current = self._current, None
@@ -1394,6 +1434,7 @@ class DatasetPrepWindow(QMainWindow):
                 self._log("The complete training output is also saved in checkpoints/clean_<bucket>pct/train_log.txt\n")
             QApplication.alert(self)
         self.progress.setRange(0, 100); self.progress.setValue(0)
+        self._update_worker_bars('')
         self._set_running(False)
         self._refresh_status()
 

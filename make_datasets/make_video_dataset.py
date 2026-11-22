@@ -28,6 +28,8 @@ from models import runmodel, loadmodel
 from models.yolo_mosaic_detector import YoloMosaicDetector
 import util.image_processing as impro
 from util import filt, util, mosaic, data, ffmpeg
+from tools.filter_subtitled_scenes import detect_single_image_subtitles, split_clean_runs, MIN_FRAMES as SUB_MIN_FRAMES
+
 
 opt.parser.add_argument('--datadir', type=str, default='your video dir', help='')
 opt.parser.add_argument('--savedir', type=str, default='../datasets/video/face', help='')
@@ -117,7 +119,8 @@ state_lock = threading.Lock()
 cnt_lock = threading.Lock()
 
 next_clip_id = start_cnt
-active_names = set()
+slot_pool = list(range(workers))
+worker_slots = {}  # slot_idx -> "W1: name [stage]@pct"
 completed_videos = 0
 total_todo = len(todo_videos)
 starttime = datetime.datetime.now()
@@ -141,9 +144,17 @@ def _emit_gui_progress(msg=""):
     if not use_gui:
         return
     with state_lock:
-        act = ", ".join(sorted(active_names)) if active_names else "idle"
+        w_str = ";".join(worker_slots[k] for k in sorted(worker_slots))
         done_n = completed_videos
-    print(f"@@PROGRESS|done={done_n}|total={total_todo}|active={act}|msg={msg}", flush=True)
+    print(f"@@PROGRESS|done={done_n}|total={total_todo}|workers={w_str}|msg={msg}", flush=True)
+
+
+def _set_worker_status(slot, name, stage, pct=None):
+    short = name if len(name) <= 22 else name[:19] + "..."
+    pct_part = f"@{pct}" if pct is not None else "@"
+    with state_lock:
+        worker_slots[slot] = f"W{slot + 1}: {short} [{stage}]{pct_part}"
+    _emit_gui_progress()
 
 
 def _process_one_video(videopath):
@@ -155,8 +166,8 @@ def _process_one_video(videopath):
     clips_created = 0
 
     with state_lock:
-        active_names.add(vname)
-    _emit_gui_progress(f"scanning {vname}")
+        slot = slot_pool.pop(0)
+    _set_worker_status(slot, vname, "scan", 0)
 
     try:
         if opt.no_sclectscene:
@@ -177,6 +188,8 @@ def _process_one_video(videopath):
             )
             for cut_point in pbar:
                 stamp = util.second2stamp(cut_point * opt.interval)
+                if len(cut_points) > 0:
+                    _set_worker_status(slot, vname, "scan", int(100 * cut_point / len(cut_points)))
                 if show_inner_pbar:
                     pbar.set_postfix_str(f"t={stamp} hits={len(timestamps)}", refresh=False)
                 _clean_worker_temp(worker_tmp)
@@ -211,7 +224,8 @@ def _process_one_video(videopath):
 
         util.writelog(os.path.join(opt.savedir, 'opt.txt'), videopath + '\n' + str(timestamps))
 
-        for timestamp in tqdm(timestamps, desc="Extracting", unit="scene", leave=False, disable=not show_inner_pbar):
+        for ts_idx, timestamp in enumerate(tqdm(timestamps, desc="Extracting", unit="scene", leave=False, disable=not show_inner_pbar)):
+            _set_worker_status(slot, vname, f"extract {ts_idx + 1}/{len(timestamps)}", int(100 * ts_idx / max(1, len(timestamps))))
             cid = _alloc_clip_id()
             savecnt = '%05d' % cid
             origindir = os.path.join(opt.savedir, savecnt, 'origin_image')
@@ -256,7 +270,7 @@ def _process_one_video(videopath):
             for c in range(3):
                 positions[:, c] = filt.medfilt(positions[:, c], opt.medfilt_num)
 
-            n_written = 0
+            cropped_pairs = []
             for i in range(len(imgs)):
                 x, y, size = positions[i][0], positions[i][1], positions[i][2]
                 tmp_cnt = i
@@ -277,15 +291,33 @@ def _process_one_video(videopath):
                 local_sides.append(min(y1 - y0, x1 - x0))
                 img_out = impro.resize(imgs[i][y0:y1, x0:x1], opt.outsize, interpolation=cv2.INTER_CUBIC)
                 mask_out = impro.resize(masks[i][y0:y1, x0:x1], opt.outsize, interpolation=cv2.INTER_CUBIC)
-                impro.imwrite(os.path.join(origindir, '%05d' % (i + 1) + '.jpg'), img_out)
-                impro.imwrite(os.path.join(maskdir, '%05d' % (i + 1) + '.png'), mask_out)
-                n_written += 1
+                cropped_pairs.append((img_out, mask_out))
 
-            if n_written == 0:
+            min_keep = min(SUB_MIN_FRAMES, max(1, int(opt.time * opt.fps * 0.8)))
+            if len(cropped_pairs) < min_keep:
                 shutil.rmtree(os.path.join(opt.savedir, savecnt), ignore_errors=True)
                 continue
 
-            clips_created += 1
+            sub_flags = detect_single_image_subtitles([p[0] for p in cropped_pairs])
+            runs = split_clean_runs(sub_flags, min_keep) if any(sub_flags) else [(0, len(cropped_pairs))]
+            if not runs:
+                shutil.rmtree(os.path.join(opt.savedir, savecnt), ignore_errors=True)
+                continue
+
+            for r_idx, (s_i, e_i) in enumerate(runs):
+                if r_idx == 0:
+                    cur_orig, cur_mask = origindir, maskdir
+                else:
+                    sub_cid = _alloc_clip_id()
+                    sub_cnt = '%05d' % sub_cid
+                    cur_orig = os.path.join(opt.savedir, sub_cnt, 'origin_image')
+                    cur_mask = os.path.join(opt.savedir, sub_cnt, 'mask')
+                    util.makedirs(cur_orig)
+                    util.makedirs(cur_mask)
+                for out_i, src_i in enumerate(range(s_i, e_i), start=1):
+                    impro.imwrite(os.path.join(cur_orig, f"{out_i:05d}.jpg"), cropped_pairs[src_i][0])
+                    impro.imwrite(os.path.join(cur_mask, f"{out_i:05d}.png"), cropped_pairs[src_i][1])
+                clips_created += 1
 
         with open(os.path.join(done_dir, _video_done_key(videopath)), 'w', encoding='utf-8') as f:
             f.write(f"ok clips={clips_created}\n")
@@ -298,7 +330,9 @@ def _process_one_video(videopath):
             shutil.rmtree(worker_tmp, ignore_errors=True)
         dt = time.time() - t0
         with state_lock:
-            active_names.discard(vname)
+            worker_slots.pop(slot, None)
+            slot_pool.append(slot)
+            slot_pool.sort()
             completed_videos += 1
             idx_now = completed_videos
             native_sides.extend(local_sides)
