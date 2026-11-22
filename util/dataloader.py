@@ -1,22 +1,10 @@
 import os
 import random
 import numpy as np
-import cv2
 from multiprocessing import Process, Queue
 from . import image_processing as impro
 from . import mosaic,data
 
-def _pad_synthetic_mask(mask, kernel):
-    """Expand tight YOLO mask by `kernel` pixels while keeping a >=10% unmasked border margin."""
-    if kernel is None:
-        return mask
-    h, w = mask.shape[:2]
-    mh, mw = max(16, int(0.10 * h)), max(16, int(0.10 * w))
-    dilated = cv2.dilate(mask, kernel, iterations=1)
-    safe = np.zeros_like(dilated)
-    safe[mh:h - mh, mw:w - mw] = dilated[mh:h - mh, mw:w - mw]
-    # Keep original mask pixels inside border if the raw ROI already touched the edge
-    return np.maximum(mask, safe)
 class VideoLoader(object):
     """docstring for VideoLoader
     Load a single video(Converted to images)
@@ -47,29 +35,19 @@ class VideoLoader(object):
         # according to what it actually contains.
         self.use_real_mosaic = os.path.isdir(os.path.join(video_dir, 'mosaic_image'))
 
-        self.mask_pad_kernel = None
         if not self.use_real_mosaic:
             feg_ori =  impro.imread(os.path.join(video_dir,'origin_image','00001.jpg'),loadsize=self.opt.loadsize,rgb=True)
             feg_mask = impro.imread(os.path.join(video_dir,'mask','00001.png'),mod='gray',loadsize=self.opt.loadsize)
             target_pct = getattr(opt, 'dataset_mosaic_pct', None)
             self.mosaic_size,self.mod,self.rect_rat,self.feather = mosaic.get_random_parameter(feg_ori,feg_mask,target_pct=target_pct)
             self.startpos = [random.randint(0,self.mosaic_size),random.randint(0,self.mosaic_size)]
-            if not test_flag and random.random() < 0.70:
-                k_sz = random.randrange(15, 41, 2)
-                self.mask_pad_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_sz, k_sz))
-            else:
-                self.mask_pad_kernel = None
-
         #Init load pool
         for i in range(self.opt.S*self.opt.T):
             _ori_img = impro.imread(os.path.join(video_dir,'origin_image','%05d' % (i+1)+'.jpg'),loadsize=self.loadsize,rgb=True)
             if self.use_real_mosaic:
                 _mosaic_img = impro.imread(os.path.join(video_dir,'mosaic_image','%05d' % (i+1)+'.jpg'),loadsize=self.loadsize,rgb=True)
             else:
-                _mask = _pad_synthetic_mask(
-                    impro.imread(os.path.join(video_dir,'mask','%05d' % (i+1)+'.png' ),mod='gray',loadsize=self.loadsize),
-                    self.mask_pad_kernel,
-                )
+                _mask = impro.imread(os.path.join(video_dir,'mask','%05d' % (i+1)+'.png' ),mod='gray',loadsize=self.loadsize)
                 _mosaic_img = mosaic.addmosaic_base(_ori_img, _mask, self.mosaic_size,0, self.mod,self.rect_rat,self.feather,self.startpos)
             _ori_img = data.random_transform_single_image(_ori_img,opt.finesize,self.transform_params)
             _mosaic_img = data.random_transform_single_image(_mosaic_img,opt.finesize,self.transform_params)
@@ -118,10 +96,7 @@ class VideoLoader(object):
             if self.use_real_mosaic:
                 _mosaic_img = impro.imread(os.path.join(self.video_dir,'mosaic_image','%05d' % (self.opt.S*self.opt.T+self.t)+'.jpg'),loadsize=self.loadsize,rgb=True)
             else:
-                _mask = _pad_synthetic_mask(
-                    impro.imread(os.path.join(self.video_dir,'mask','%05d' % (self.opt.S*self.opt.T+self.t)+'.png' ),mod='gray',loadsize=self.loadsize),
-                    self.mask_pad_kernel,
-                )
+                _mask = impro.imread(os.path.join(self.video_dir,'mask','%05d' % (self.opt.S*self.opt.T+self.t)+'.png' ),mod='gray',loadsize=self.loadsize)
                 _mosaic_img = mosaic.addmosaic_base(_ori_img, _mask, self.mosaic_size,0, self.mod,self.rect_rat,self.feather,self.startpos)
             _ori_img = data.random_transform_single_image(_ori_img,self.opt.finesize,self.transform_params)
             _mosaic_img = data.random_transform_single_image(_mosaic_img,self.opt.finesize,self.transform_params)

@@ -212,7 +212,7 @@ def _process_one_video(videopath):
                             if mask is None:
                                 mask = np.zeros(img.shape[:2], dtype=np.uint8)
                         else:
-                            mask = runmodel.get_ROI_position(img, net, opt, keepsize=True)[0]
+                            mask = runmodel.get_ROI_position(img, net, opt, keepsize=True)
                     if not opt.all_mosaic_area:
                         mask = impro.find_mostlikely_ROI(mask)
                     x, y, size, area = impro.boundingSquare(mask, Ex_mul=1)
@@ -244,7 +244,7 @@ def _process_one_video(videopath):
 
             imagepaths = sorted(util.Traversal(worker_tmp))
             imgs, masks = [], []
-            ex_mul = random.uniform(1.35, 1.85)
+            ex_mul = random.uniform(1.65, 2.25)
             positions = []
             for imagepath in imagepaths:
                 img = impro.imread(imagepath)
@@ -256,7 +256,9 @@ def _process_one_video(videopath):
                         if mask is None:
                             mask = np.zeros(img.shape[:2], dtype=np.uint8)
                     else:
-                        mask = runmodel.get_ROI_position(img, net, opt, keepsize=True)[0]
+                        mask = runmodel.get_ROI_position(img, net, opt, keepsize=True)
+                if not opt.all_mosaic_area:
+                    mask = impro.find_mostlikely_ROI(mask)
                 imgs.append(img)
                 masks.append(mask)
                 x, y, size, area = impro.boundingSquare(mask, Ex_mul=ex_mul)
@@ -271,9 +273,11 @@ def _process_one_video(videopath):
                 positions[:, c] = filt.medfilt(positions[:, c], opt.medfilt_num)
 
             cropped_pairs = []
-            k_pad = random.randrange(15, 37, 2)
-            pad_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_pad, k_pad))
-            mh = max(16, int(0.10 * opt.outsize))
+            w_expand = random.uniform(0.45, 0.85)
+            h_expand = random.uniform(0.30, 0.65)
+            mh = max(12, int(0.08 * opt.outsize))
+            pad_kernel = None
+
             for i in range(len(imgs)):
                 x, y, size = positions[i][0], positions[i][1], positions[i][2]
                 tmp_cnt = i
@@ -294,11 +298,21 @@ def _process_one_video(videopath):
                 local_sides.append(min(y1 - y0, x1 - x0))
                 img_out = impro.resize(imgs[i][y0:y1, x0:x1], opt.outsize, interpolation=cv2.INTER_CUBIC)
                 mask_out = impro.resize(masks[i][y0:y1, x0:x1], opt.outsize, interpolation=cv2.INTER_CUBIC)
+
+                if pad_kernel is None:
+                    ys_m, xs_m = np.where(mask_out > 127)
+                    rw = max(24, int(xs_m.max() - xs_m.min() + 1)) if len(xs_m) else int(0.30 * opt.outsize)
+                    rh = max(24, int(ys_m.max() - ys_m.min() + 1)) if len(ys_m) else int(0.30 * opt.outsize)
+                    kw = max(5, int(round(rw * w_expand)) | 1)
+                    kh = max(5, int(round(rh * h_expand)) | 1)
+                    pad_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kw, kh))
+
                 dilated = cv2.dilate(mask_out, pad_kernel, iterations=1)
                 safe = np.zeros_like(dilated)
                 safe[mh:opt.outsize - mh, mh:opt.outsize - mh] = dilated[mh:opt.outsize - mh, mh:opt.outsize - mh]
                 mask_out = np.maximum(mask_out, safe)
                 cropped_pairs.append((img_out, mask_out))
+
 
             min_keep = min(SUB_MIN_FRAMES, max(1, int(opt.time * opt.fps * 0.8)))
             if len(cropped_pairs) < min_keep:
