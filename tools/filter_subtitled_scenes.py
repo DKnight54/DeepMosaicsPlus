@@ -29,6 +29,17 @@ def _has_horizontal_text_bar(binary_mask, gray_band):
                 return True
     return False
 
+def _load_scaled_bgr(item, target_w=640):
+    """Load BGR image from path or array, returning (scaled_bgr, orig_w, orig_h)."""
+    bgr = cv2.imread(item) if isinstance(item, str) else item
+    if bgr is None:
+        return None, 0, 0
+    oh, ow = bgr.shape[:2]
+    if ow > target_w:
+        sh = max(1, int(round(oh * (target_w / float(ow)))))
+        return cv2.resize(bgr, (target_w, sh), interpolation=cv2.INTER_AREA), ow, oh
+    return bgr, ow, oh
+
 def has_subtitle_in_pair(orig_bgr, mos_bgr):
     """Detect horizontal burned-in subtitle lines in origin_image absent in mosaic_image."""
     h, _ = orig_bgr.shape[:2]
@@ -115,24 +126,36 @@ def crop_overlaps_boxes(crop_box, boxes):
     return False
 
 
-def find_fullframe_overlay_boxes(orig_bgr_list, mos_bgr_list=None, min_persist=5):
+def find_fullframe_overlay_boxes(orig_items, mos_items=None, min_persist=5):
     """Detect full-frame subtitle boxes (bottom 35%) and static corner watermark boxes per frame."""
-    n = len(orig_bgr_list)
+    n = len(orig_items)
     if n == 0:
         return []
-    h, w = orig_bgr_list.shape[:2]
-    y_band = int(h * BOTTOM_BAND_RATIO)
-    k_line = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3))
-    k_dil = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 5))
+    k_line = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 3))
+    k_dil = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
 
-    # 1. Per-frame subtitle bounding boxes in full-frame coordinates
     raw_sub_boxes = [[] for _ in range(n)]
-    for idx, bgr in enumerate(orig_bgr_list):
+    wm_samples = []
+    sample_step = max(1, n // 12)
+    orig_w = orig_h = 0
+
+    for idx, item in enumerate(orig_items):
+        bgr, ow, oh = _load_scaled_bgr(item, target_w=640)
         if bgr is None:
             continue
+        orig_w, orig_h = ow, oh
+        sh, sw = bgr.shape[:2]
+        sx, sy = ow / float(sw), oh / float(sh)
+        if idx % sample_step == 0 and len(wm_samples) < 12:
+            wm_samples.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32))
+
+        y_band = int(sh * BOTTOM_BAND_RATIO)
         gray = cv2.cvtColor(bgr[y_band:, :], cv2.COLOR_BGR2GRAY).astype(np.float32)
-        if mos_bgr_list is not None and idx < len(mos_bgr_list) and mos_bgr_list[idx] is not None:
-            m_gray = cv2.cvtColor(mos_bgr_list[idx][y_band:, :], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        if mos_items is not None and idx < len(mos_items) and mos_items[idx] is not None:
+            m_bgr, _, _ = _load_scaled_bgr(mos_items[idx], target_w=640)
+            if m_bgr is None or m_bgr.shape[:2] != (sh, sw):
+                continue
+            m_gray = cv2.cvtColor(m_bgr[y_band:, :], cv2.COLOR_BGR2GRAY).astype(np.float32)
             if float(np.mean(np.abs(gray - m_gray) < 12.0)) < 0.78:
                 continue
             cand = (gray > 225.0) & ((gray - m_gray) > 85.0)
@@ -149,13 +172,16 @@ def find_fullframe_overlay_boxes(orig_bgr_list, mos_bgr_list=None, min_persist=5
         num_lbl, _, stats, _ = cv2.connectedComponentsWithStats(merged)
         for lbl in range(1, num_lbl):
             x, y, bw, bh, area = stats[lbl]
-            if bw >= 60 and (8 <= bh <= 55) and (bw / max(1, bh) >= 3.0) and area >= 350:
+            if bw >= 24 and (4 <= bh <= 26) and (bw / max(1, bh) >= 2.8) and area >= 80:
                 rm = cand[y:y + bh, x:x + bw] > 0
-                if rm.any() and float(np.mean(gx[y:y + bh, x:x + bw][rm])) > 65.0:
-                    raw_sub_boxes[idx].append((max(0, x - 6), max(0, y_band + y - 6),
-                                               min(w, x + bw + 6), min(h, y_band + y + bh + 6)))
+                if rm.any() and float(np.mean(gx[y:y + bh, x:x + bw][rm])) > 55.0:
+                    raw_sub_boxes[idx].append((
+                        max(0, int(round((x - 4) * sx))),
+                        max(0, int(round((y_band + y - 4) * sy))),
+                        min(ow, int(round((x + bw + 4) * sx))),
+                        min(oh, int(round((y_band + y + bh + 4) * sy))),
+                    ))
 
-    # Temporal persistence (>= min_persist consecutive frames) for subtitles
     has_sub = [len(b) > 0 for b in raw_sub_boxes]
     persist_boxes = [[] for _ in range(n)]
     i = 0
@@ -177,31 +203,33 @@ def find_fullframe_overlay_boxes(orig_bgr_list, mos_bgr_list=None, min_persist=5
         else:
             i += 1
 
-    # 2. Static corner watermark boxes (frozen high-gradient pixels across >= 8 sampled frames)
     wm_boxes = []
-    if n >= 15:
-        step = max(1, n // 12)
-        grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).astype(np.float32) for f in orig_bgr_list[::step][:12] if f is not None]
-        if len(grays) >= 6:
-            stack = np.stack(grays, axis=0)
-            t_std = np.std(stack, axis=0)
-            mean_img = np.mean(stack, axis=0)
-            gx_m = np.abs(cv2.Sobel(mean_img, cv2.CV_32F, 1, 0, ksize=3))
-            gy_m = np.abs(cv2.Sobel(mean_img, cv2.CV_32F, 0, 1, ksize=3))
-            static_edge = ((t_std < 3.5) & ((gx_m + gy_m) > 55.0)).astype(np.uint8)
-            # Restrict to outer 18% border bands where watermarks/logos sit
-            border = np.zeros_like(static_edge)
-            bh_m, bw_m = int(0.18 * h), int(0.18 * w)
-            border[:bh_m, :] = 1
-            border[h - bh_m:, :] = 1
-            border[:, :bw_m] = 1
-            border[:, w - bw_m:] = 1
-            wm_mask = cv2.morphologyEx(static_edge & border, cv2.MORPH_CLOSE, k_line)
-            num_lbl, _, stats, _ = cv2.connectedComponentsWithStats(wm_mask)
-            for lbl in range(1, num_lbl):
-                x, y, bw, bh, area = stats[lbl]
-                if bw >= 35 and bh >= 12 and area >= 220:
-                    wm_boxes.append((max(0, x - 6), max(0, y - 6), min(w, x + bw + 6), min(h, y + bh + 6)))
+    if len(wm_samples) >= 6 and orig_w > 0:
+        stack = np.stack(wm_samples, axis=0)
+        sh, sw = stack.shape[1], stack.shape[2]
+        sx, sy = orig_w / float(sw), orig_h / float(sh)
+        t_std = np.std(stack, axis=0)
+        mean_img = np.mean(stack, axis=0)
+        gx_m = np.abs(cv2.Sobel(mean_img, cv2.CV_32F, 1, 0, ksize=3))
+        gy_m = np.abs(cv2.Sobel(mean_img, cv2.CV_32F, 0, 1, ksize=3))
+        static_edge = ((t_std < 3.5) & ((gx_m + gy_m) > 55.0)).astype(np.uint8)
+        border = np.zeros_like(static_edge)
+        bh_m, bw_m = int(0.18 * sh), int(0.18 * sw)
+        border[:bh_m, :] = 1
+        border[sh - bh_m:, :] = 1
+        border[:, :bw_m] = 1
+        border[:, sw - bw_m:] = 1
+        wm_mask = cv2.morphologyEx(static_edge & border, cv2.MORPH_CLOSE, k_line)
+        num_lbl, _, stats, _ = cv2.connectedComponentsWithStats(wm_mask)
+        for lbl in range(1, num_lbl):
+            x, y, bw, bh, area = stats[lbl]
+            if bw >= 14 and bh >= 6 and area >= 50:
+                wm_boxes.append((
+                    max(0, int(round((x - 4) * sx))),
+                    max(0, int(round((y - 4) * sy))),
+                    min(orig_w, int(round((x + bw + 4) * sx))),
+                    min(orig_h, int(round((y + bh + 4) * sy))),
+                ))
 
     return [persist_boxes[idx] + wm_boxes for idx in range(n)]
 

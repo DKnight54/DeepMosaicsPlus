@@ -151,18 +151,17 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
         pos[:, c] = _edge_median(pos[:, c], win)
 
     ex_mul = random.uniform(*ex_range)
-    mos_imgs, orig_imgs = [], []
-    for name in names:
-        mos_imgs.append(impro.imread(os.path.join(mosaic_dir, name)))
-        orig_imgs.append(impro.imread(os.path.join(origin_dir, name)))
+    orig_paths = [os.path.join(origin_dir, name) for name in names]
+    mos_paths = [os.path.join(mosaic_dir, name) for name in names]
+    overlay_boxes = find_fullframe_overlay_boxes(orig_paths, mos_paths)
 
-    overlay_boxes = find_fullframe_overlay_boxes(orig_imgs, mos_imgs)
     dirty_flags = []
     cropped_pairs = []
     sides, size_mismatch = [], False
 
     for i, name in enumerate(tqdm(names, desc='  Cropping Mosaic area', leave=False, disable=not show_pbar)):
-        mosaic, origin = mos_imgs[i], orig_imgs[i]
+        mosaic = impro.imread(mos_paths[i])
+        origin = impro.imread(orig_paths[i])
         if mosaic is None or origin is None:
             dirty_flags.append(True)
             cropped_pairs.append(None)
