@@ -4,7 +4,24 @@ import numpy as np
 from multiprocessing import Process, Queue
 from . import image_processing as impro
 from . import mosaic,data
+from PIL import Image
 
+def _frame_mosaic_size(mask_path, base_mosaic_size, frame_idx, total_frames, phase, amp):
+    """Scale base_mosaic_size by embedded med_crop_ratio/crop_ratio metadata (or smooth fallback curve)."""
+    try:
+        with Image.open(mask_path) as im:
+            info = getattr(im, "info", {}) or {}
+            c_rat = float(info["crop_ratio"])
+            m_rat = float(info["med_crop_ratio"])
+            if c_rat > 0 and m_rat > 0:
+                scale = float(np.clip(m_rat / c_rat, 0.65, 1.50))
+                return max(2, int(round(base_mosaic_size * scale)))
+    except Exception:
+        pass
+    # Smooth fallback breathing curve (~1.00 +/- amp) for clips without crop_ratio metadata
+    t_norm = float(frame_idx) / max(1.0, float(total_frames - 1))
+    scale = 1.0 + amp * np.sin(2.0 * np.pi * t_norm + phase)
+    return max(2, int(round(base_mosaic_size * scale)))
 class VideoLoader(object):
     """docstring for VideoLoader
     Load a single video(Converted to images)
@@ -41,14 +58,18 @@ class VideoLoader(object):
             target_pct = getattr(opt, 'dataset_mosaic_pct', None)
             self.mosaic_size,self.mod,self.rect_rat,self.feather = mosaic.get_random_parameter(feg_ori,feg_mask,target_pct=target_pct)
             self.startpos = [random.randint(0,self.mosaic_size),random.randint(0,self.mosaic_size)]
+            self._breath_phase = random.uniform(0.0, 2.0 * np.pi)
+            self._breath_amp = 0.0 if test_flag else random.uniform(0.10, 0.25)
         #Init load pool
         for i in range(self.opt.S*self.opt.T):
             _ori_img = impro.imread(os.path.join(video_dir,'origin_image','%05d' % (i+1)+'.jpg'),loadsize=self.loadsize,rgb=True)
             if self.use_real_mosaic:
                 _mosaic_img = impro.imread(os.path.join(video_dir,'mosaic_image','%05d' % (i+1)+'.jpg'),loadsize=self.loadsize,rgb=True)
             else:
-                _mask = impro.imread(os.path.join(video_dir,'mask','%05d' % (i+1)+'.png' ),mod='gray',loadsize=self.loadsize)
-                _mosaic_img = mosaic.addmosaic_base(_ori_img, _mask, self.mosaic_size,0, self.mod,self.rect_rat,self.feather,self.startpos)
+                _mask_path = os.path.join(video_dir, 'mask', '%05d' % (i + 1) + '.png')
+                _mask = impro.imread(_mask_path, mod='gray', loadsize=self.loadsize)
+                _cur_msize = _frame_mosaic_size(_mask_path, self.mosaic_size, i + 1, self.opt.M, self._breath_phase, self._breath_amp)
+                _mosaic_img = mosaic.addmosaic_base(_ori_img, _mask, _cur_msize, 0, self.mod, self.rect_rat, self.feather, self.startpos)
             _ori_img = data.random_transform_single_image(_ori_img,opt.finesize,self.transform_params)
             _mosaic_img = data.random_transform_single_image(_mosaic_img,opt.finesize,self.transform_params)
 
@@ -96,8 +117,11 @@ class VideoLoader(object):
             if self.use_real_mosaic:
                 _mosaic_img = impro.imread(os.path.join(self.video_dir,'mosaic_image','%05d' % (self.opt.S*self.opt.T+self.t)+'.jpg'),loadsize=self.loadsize,rgb=True)
             else:
-                _mask = impro.imread(os.path.join(self.video_dir,'mask','%05d' % (self.opt.S*self.opt.T+self.t)+'.png' ),mod='gray',loadsize=self.loadsize)
-                _mosaic_img = mosaic.addmosaic_base(_ori_img, _mask, self.mosaic_size,0, self.mod,self.rect_rat,self.feather,self.startpos)
+                _f_idx = self.opt.S * self.opt.T + self.t
+                _mask_path = os.path.join(self.video_dir, 'mask', '%05d' % _f_idx + '.png')
+                _mask = impro.imread(_mask_path, mod='gray', loadsize=self.loadsize)
+                _cur_msize = _frame_mosaic_size(_mask_path, self.mosaic_size, _f_idx, self.opt.M, self._breath_phase, self._breath_amp)
+                _mosaic_img = mosaic.addmosaic_base(_ori_img, _mask, _cur_msize, 0, self.mod, self.rect_rat, self.feather, self.startpos)
             _ori_img = data.random_transform_single_image(_ori_img,self.opt.finesize,self.transform_params)
             _mosaic_img = data.random_transform_single_image(_mosaic_img,self.opt.finesize,self.transform_params)
             

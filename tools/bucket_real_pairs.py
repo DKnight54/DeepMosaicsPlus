@@ -47,7 +47,13 @@ from util import ffmpeg as ffmpeg_util
 from util import util as util_
 from util import image_processing as impro
 from models.yolo_mosaic_detector import YoloMosaicDetector
-from tools.filter_subtitled_scenes import has_subtitle_in_pair, split_clean_runs, MIN_FRAMES as SUB_MIN_FRAMES
+from tools.filter_subtitled_scenes import (
+    has_subtitle_in_pair,
+    split_clean_runs,
+    find_fullframe_overlay_boxes,
+    crop_overlaps_boxes,
+    MIN_FRAMES as SUB_MIN_FRAMES,
+)
 
 
 def find_pairs(censored_dir, uncensored_dir):
@@ -145,12 +151,22 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
         pos[:, c] = _edge_median(pos[:, c], win)
 
     ex_mul = random.uniform(*ex_range)
+    mos_imgs, orig_imgs = [], []
+    for name in names:
+        mos_imgs.append(impro.imread(os.path.join(mosaic_dir, name)))
+        orig_imgs.append(impro.imread(os.path.join(origin_dir, name)))
+
+    overlay_boxes = find_fullframe_overlay_boxes(orig_imgs, mos_imgs)
+    dirty_flags = []
+    cropped_pairs = []
     sides, size_mismatch = [], False
-    name_set = set(names)
 
     for i, name in enumerate(tqdm(names, desc='  Cropping Mosaic area', leave=False, disable=not show_pbar)):
-        mosaic = impro.imread(os.path.join(mosaic_dir, name))
-        origin = impro.imread(os.path.join(origin_dir, name))
+        mosaic, origin = mos_imgs[i], orig_imgs[i]
+        if mosaic is None or origin is None:
+            dirty_flags.append(True)
+            cropped_pairs.append(None)
+            continue
         h, w = mosaic.shape[:2]
         if origin.shape[:2] != (h, w):
             origin = cv2.resize(origin, (w, h), interpolation=cv2.INTER_AREA)
@@ -158,24 +174,81 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
         half = max(8, min(int(pos[i, 2] * ex_mul), h // 2, w // 2))
         cx = int(np.clip(pos[i, 0], half, w - half))
         cy = int(np.clip(pos[i, 1], half, h - half))
+        crop_rect = (cx - half, cy - half, cx + half, cy + half)
+        if i < len(overlay_boxes) and crop_overlaps_boxes(crop_rect, overlay_boxes[i]):
+            dirty_flags.append(True)
+            cropped_pairs.append(None)
+            continue
+
+        dirty_flags.append(False)
         box = (slice(cy - half, cy + half), slice(cx - half, cx + half))
         interp = cv2.INTER_AREA if 2 * half > outsize else cv2.INTER_CUBIC
-        impro.imwrite(os.path.join(mosaic_dir, name), cv2.resize(mosaic[box], (outsize, outsize), interpolation=interp))
-        impro.imwrite(os.path.join(origin_dir, name), cv2.resize(origin[box], (outsize, outsize), interpolation=interp))
+        cropped_pairs.append((
+            cv2.resize(origin[box], (outsize, outsize), interpolation=interp),
+            cv2.resize(mosaic[box], (outsize, outsize), interpolation=interp),
+        ))
         sides.append(2 * half)
 
+    # Clear raw full-size frames and keep only clean runs >= min_frames
     for d in (origin_dir, mosaic_dir):
         for f in os.listdir(d):
-            if f.lower().endswith('.jpg') and f not in name_set:
+            if f.lower().endswith('.jpg'):
                 os.remove(os.path.join(d, f))
 
+    runs = split_clean_runs(dirty_flags, min_frames) if any(dirty_flags) else (
+        [(0, len(cropped_pairs))] if len(cropped_pairs) >= min_frames else []
+    )
+    if not runs:
+        return None
+
+    parent_dir = os.path.dirname(origin_dir)
+    for r_idx, (s_i, e_i) in enumerate(runs):
+        if len(runs) == 1 and r_idx == 0:
+            cur_orig, cur_mos = origin_dir, mosaic_dir
+        else:
+            sub_dir = f"{parent_dir}_sub{r_idx}"
+            cur_orig = os.path.join(sub_dir, 'origin_image')
+            cur_mos = os.path.join(sub_dir, 'mosaic_image')
+            os.makedirs(cur_orig, exist_ok=True)
+            os.makedirs(cur_mos, exist_ok=True)
+        for out_i, src_i in enumerate(range(s_i, e_i), start=1):
+            impro.imwrite(os.path.join(cur_orig, f"{out_i:05d}.jpg"), cropped_pairs[src_i][0])
+            impro.imwrite(os.path.join(cur_mos, f"{out_i:05d}.jpg"), cropped_pairs[src_i][1])
+
+    if len(runs) > 1:
+        shutil.rmtree(parent_dir, ignore_errors=True)
+
+    kept_frames = sum(e_i - s_i for s_i, e_i in runs)
     return {
-        'frames': n,
+        'frames': kept_frames,
         'median_side': int(np.median(sides)),
         'ex_mul': ex_mul,
         'enlarged_pct': 100.0 * float(np.mean(np.array(sides) < outsize)),
         'resized_origin': size_mismatch,
+        'sub_clips': len(runs),
     }
+
+def _measure_postcrop_scene_pct(clip_dir, min_pct, max_pct, fallback_pct):
+    """Measure mosaic block % on already-cropped origin_image/mosaic_image pairs."""
+    orig_dir = os.path.join(clip_dir, 'origin_image')
+    mos_dir = os.path.join(clip_dir, 'mosaic_image')
+    names = sorted(f for f in os.listdir(orig_dir) if f.lower().endswith('.jpg'))
+    if not names:
+        return fallback_pct
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    pairs = []
+    for fn in names[::max(1, len(names) // 8)][:8]:
+        oi = cv2.imread(os.path.join(orig_dir, fn))
+        mi = cv2.imread(os.path.join(mos_dir, fn))
+        if oi is None or mi is None or oi.shape != mi.shape:
+            continue
+        diff = (np.abs(oi.astype(np.int16) - mi.astype(np.int16)).mean(axis=2) > 12).astype(np.uint8) * 255
+        mask = cv2.morphologyEx(diff, cv2.MORPH_CLOSE, k_close)
+        pairs.append((mi, mask))
+    res = mosaic_util.estimate_mosaic_block_pct_multi(
+        pairs, min_confidence=0.12, min_pct=max(2.0, min_pct), max_pct=max(max_pct, 12.0)
+    )
+    return res['pct'] if res else fallback_pct
 
 def _split_subtitles_in_place(bucket_dir, min_frames=SUB_MIN_FRAMES):
     """Split a newly cropped pair folder into _sub0, _sub1... if burned-in subtitles are detected."""
@@ -355,8 +428,8 @@ def detect_pct(opt, netM, censored_video, n_samples, min_pct, max_pct,
         res = mosaic_util.estimate_mosaic_block_pct_multi(
             pairs,
             min_confidence=min_conf,
-            min_pct=min_pct,
-            max_pct=max_pct,
+            min_pct=1.2,
+            max_pct=max(max_pct, 12.0),
         )
         if res is None:
             continue
@@ -394,10 +467,10 @@ def maybe_reuse_uncensored(pairs, mode, synthetic_source_dir):
 
 def _cleanup_partial_pair(output_dir, pair_name):
     """Remove any leftover scene folders for a pair that did not finish cleanly."""
-    pattern = os.path.join(output_dir, 'bucket_*', f"{pair_name}_scene*")
-    for d in glob.glob(pattern):
-        if os.path.isdir(d):
-            shutil.rmtree(d, ignore_errors=True)
+    for sub in ('bucket_*', '_staging'):
+        for d in glob.glob(os.path.join(output_dir, sub, f"{pair_name}_scene*")):
+            if os.path.isdir(d):
+                shutil.rmtree(d, ignore_errors=True)
 
 
 def _find_existing_pair_scenes(output_dir, pair_name):
@@ -596,11 +669,10 @@ def main():
                         continue
 
                     set_worker_status(slot, name, f"scene {scene_idx + 1}/{len(scenes)}")
-                    _, bucket = loadmodel.select_model_by_pct(sc['pct'], manifest_path)
                     clip_name = f"{name}_scene{scene_idx:03d}"
-                    bucket_dir = os.path.join(known.output_dir, f'bucket_{bucket:g}', clip_name)
-                    origin_dir = os.path.join(bucket_dir, 'origin_image')
-                    mosaic_dir = os.path.join(bucket_dir, 'mosaic_image')
+                    stage_dir = os.path.join(known.output_dir, '_staging', clip_name)
+                    origin_dir = os.path.join(stage_dir, 'origin_image')
+                    mosaic_dir = os.path.join(stage_dir, 'mosaic_image')
 
                     extract_frames(uncensored_path, origin_dir, known.fps,
                                    start_sec=sc['start'], duration_sec=sc['duration'])
@@ -621,23 +693,43 @@ def main():
                             show_pbar=show_inner_pbar,
                         )
                         if stats is None:
-                            shutil.rmtree(bucket_dir, ignore_errors=True)
+                            shutil.rmtree(stage_dir, ignore_errors=True)
                             continue
-                        n_clean_clips = _split_subtitles_in_place(bucket_dir, min_frames=known.min_frames)
-                        if n_clean_clips == 0:
+                        stage_dirs = sorted(glob.glob(f"{stage_dir}*"))
+                        if not stage_dirs:
                             continue
-                        sub_note = f" -> {n_clean_clips} clean sub-clip(s)" if n_clean_clips > 1 else ""
+                        sub_total = 0
+                        for sd in stage_dirs:
+                            sub_name = os.path.basename(sd)
+                            post_pct = _measure_postcrop_scene_pct(sd, min_pct, max_pct, sc['pct'])
+                            _, bucket = loadmodel.select_model_by_pct(post_pct, manifest_path)
+                            bucket_dir = os.path.join(known.output_dir, f'bucket_{bucket:g}', sub_name)
+                            os.makedirs(os.path.dirname(bucket_dir), exist_ok=True)
+                            shutil.move(sd, bucket_dir)
+                            n_clean = _split_subtitles_in_place(bucket_dir, min_frames=known.min_frames)
+                            sub_total += n_clean
+                            if n_clean > 0:
+                                pair_results.append((sub_name, post_pct, bucket))
+                        if sub_total == 0:
+                            continue
+                        sub_note = f" -> {sub_total} clean sub-clip(s)" if sub_total > 1 else ""
                         pair_logs.append(
-                            f"    scene {scene_idx:03d}: pct={sc['pct']:.2f}% (conf={sc['confidence']:.2f}) "
+                            f"    scene {scene_idx:03d}: post-crop pct={post_pct:.2f}% (pre={sc['pct']:.2f}%) "
                             f"-> bucket {bucket:g}% | {stats['frames']} frames, median {stats['median_side']}px{warn}{sub_note}"
                         )
                     else:
+                        post_pct = sc['pct']
+                        _, bucket = loadmodel.select_model_by_pct(post_pct, manifest_path)
+                        bucket_dir = os.path.join(known.output_dir, f'bucket_{bucket:g}', clip_name)
+                        os.makedirs(os.path.dirname(bucket_dir), exist_ok=True)
+                        shutil.move(stage_dir, bucket_dir)
                         pair_logs.append(
-                            f"    scene {scene_idx:03d}: pct={sc['pct']:.2f}% (conf={sc['confidence']:.2f}) "
+                            f"    scene {scene_idx:03d}: pct={post_pct:.2f}% (conf={sc['confidence']:.2f}) "
                             f"-> bucket {bucket:g}% | {n_orig} full frames{warn}"
                         )
+                        pair_results.append((clip_name, post_pct, bucket))
 
-                    pair_results.append((clip_name, sc['pct'], bucket))
+                    
                     kept += 1
 
                 if kept == 0:

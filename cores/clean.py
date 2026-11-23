@@ -101,6 +101,14 @@ def select_netG_for_size(opt, netG, img, mask):
         from models import loadmodel
         min_conf = getattr(opt, 'auto_model_min_confidence', 0.15)
         min_pct, max_pct = _manifest_pct_bounds(opt.model_manifest)
+        ys, xs = np.where(mask > 0)
+        if ys.size > 0 and xs.size > 0:
+            cx, cy = int(0.5 * (xs.min() + xs.max())), int(0.5 * (ys.min() + ys.max()))
+            sz = int(max(xs.max() - xs.min(), ys.max() - ys.min()) * 0.75)
+            y0, y1 = max(0, cy - sz), min(img.shape[0], cy + sz)
+            x0, x1 = max(0, cx - sz), min(img.shape[1], cx + sz)
+            if y1 > y0 and x1 > x0:
+                img, mask = img[y0:y1, x0:x1], mask[y0:y1, x0:x1]
         est = mosaic_util.estimate_mosaic_block_pct(img, mask, min_pct=min_pct, max_pct=max_pct)
         if est is None or est['confidence'] < min_conf:
             print(f"[auto_model] low-confidence size estimate, keeping current model")
@@ -148,6 +156,11 @@ def select_netG_for_size_video(opt, netG, imagepaths, positions):
                 img = impro.imread(img_path)
                 mask = cv2.imread(mask_path, 0)
                 if img is not None and mask is not None:
+                    x, y, size = int(positions[i][0]), int(positions[i][1]), int(positions[i][2])
+                    y0, y1 = max(0, y - size), min(img.shape[0], y + size)
+                    x0, x1 = max(0, x - size), min(img.shape[1], x + size)
+                    if y1 > y0 and x1 > x0:
+                        img, mask = img[y0:y1, x0:x1], mask[y0:y1, x0:x1]
                     pairs.append((img, mask))
 
         result = mosaic_util.estimate_mosaic_block_pct_multi(pairs, min_confidence=min_conf, min_pct=min_pct, max_pct=max_pct)

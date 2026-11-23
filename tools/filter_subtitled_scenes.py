@@ -106,6 +106,104 @@ def split_clean_runs(flags, min_len):
         runs.append((start, len(flags)))
     return runs
 
+def crop_overlaps_boxes(crop_box, boxes):
+    """Return True if (cx0, cy0, cx1, cy1) intersects any (bx0, by0, bx1, by1)."""
+    cx0, cy0, cx1, cy1 = crop_box
+    for bx0, by0, bx1, by1 in boxes:
+        if cx0 < bx1 and cx1 > bx0 and cy0 < by1 and cy1 > by0:
+            return True
+    return False
+
+
+def find_fullframe_overlay_boxes(orig_bgr_list, mos_bgr_list=None, min_persist=5):
+    """Detect full-frame subtitle boxes (bottom 35%) and static corner watermark boxes per frame."""
+    n = len(orig_bgr_list)
+    if n == 0:
+        return []
+    h, w = orig_bgr_list.shape[:2]
+    y_band = int(h * BOTTOM_BAND_RATIO)
+    k_line = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3))
+    k_dil = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 5))
+
+    # 1. Per-frame subtitle bounding boxes in full-frame coordinates
+    raw_sub_boxes = [[] for _ in range(n)]
+    for idx, bgr in enumerate(orig_bgr_list):
+        if bgr is None:
+            continue
+        gray = cv2.cvtColor(bgr[y_band:, :], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        if mos_bgr_list is not None and idx < len(mos_bgr_list) and mos_bgr_list[idx] is not None:
+            m_gray = cv2.cvtColor(mos_bgr_list[idx][y_band:, :], cv2.COLOR_BGR2GRAY).astype(np.float32)
+            if float(np.mean(np.abs(gray - m_gray) < 12.0)) < 0.78:
+                continue
+            cand = (gray > 225.0) & ((gray - m_gray) > 85.0)
+        else:
+            hsv = cv2.cvtColor(bgr[y_band:, :], cv2.COLOR_BGR2HSV)
+            bright = (gray > 220) & (hsv[:, :, 1] < 95)
+            outline = (cv2.dilate(bright.astype(np.uint8), k_dil) > 0) & (~bright) & (gray < 75)
+            if float(np.mean(outline)) <= 0.003:
+                continue
+            cand = bright
+
+        merged = cv2.morphologyEx(cand.astype(np.uint8), cv2.MORPH_CLOSE, k_line)
+        gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+        num_lbl, _, stats, _ = cv2.connectedComponentsWithStats(merged)
+        for lbl in range(1, num_lbl):
+            x, y, bw, bh, area = stats[lbl]
+            if bw >= 60 and (8 <= bh <= 55) and (bw / max(1, bh) >= 3.0) and area >= 350:
+                rm = cand[y:y + bh, x:x + bw] > 0
+                if rm.any() and float(np.mean(gx[y:y + bh, x:x + bw][rm])) > 65.0:
+                    raw_sub_boxes[idx].append((max(0, x - 6), max(0, y_band + y - 6),
+                                               min(w, x + bw + 6), min(h, y_band + y + bh + 6)))
+
+    # Temporal persistence (>= min_persist consecutive frames) for subtitles
+    has_sub = [len(b) > 0 for b in raw_sub_boxes]
+    persist_boxes = [[] for _ in range(n)]
+    i = 0
+    while i < n:
+        if has_sub[i]:
+            j = i
+            while j < n and has_sub[j]:
+                j += 1
+            if (j - i) >= min_persist:
+                merged_box = (
+                    min(b for f in range(i, j) for b in raw_sub_boxes[f]),
+                    min(b for f in range(i, j) for b in raw_sub_boxes[f]),
+                    max(b for f in range(i, j) for b in raw_sub_boxes[f]),
+                    max(b for f in range(i, j) for b in raw_sub_boxes[f]),
+                )
+                for k in range(max(0, i - 2), min(n, j + 2)):
+                    persist_boxes[k].append(merged_box)
+            i = j
+        else:
+            i += 1
+
+    # 2. Static corner watermark boxes (frozen high-gradient pixels across >= 8 sampled frames)
+    wm_boxes = []
+    if n >= 15:
+        step = max(1, n // 12)
+        grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).astype(np.float32) for f in orig_bgr_list[::step][:12] if f is not None]
+        if len(grays) >= 6:
+            stack = np.stack(grays, axis=0)
+            t_std = np.std(stack, axis=0)
+            mean_img = np.mean(stack, axis=0)
+            gx_m = np.abs(cv2.Sobel(mean_img, cv2.CV_32F, 1, 0, ksize=3))
+            gy_m = np.abs(cv2.Sobel(mean_img, cv2.CV_32F, 0, 1, ksize=3))
+            static_edge = ((t_std < 3.5) & ((gx_m + gy_m) > 55.0)).astype(np.uint8)
+            # Restrict to outer 18% border bands where watermarks/logos sit
+            border = np.zeros_like(static_edge)
+            bh_m, bw_m = int(0.18 * h), int(0.18 * w)
+            border[:bh_m, :] = 1
+            border[h - bh_m:, :] = 1
+            border[:, :bw_m] = 1
+            border[:, w - bw_m:] = 1
+            wm_mask = cv2.morphologyEx(static_edge & border, cv2.MORPH_CLOSE, k_line)
+            num_lbl, _, stats, _ = cv2.connectedComponentsWithStats(wm_mask)
+            for lbl in range(1, num_lbl):
+                x, y, bw, bh, area = stats[lbl]
+                if bw >= 35 and bh >= 12 and area >= 220:
+                    wm_boxes.append((max(0, x - 6), max(0, y - 6), min(w, x + bw + 6), min(h, y + bh + 6)))
+
+    return [persist_boxes[idx] + wm_boxes for idx in range(n)]
 
 def _copy_split_clip(src_dir, dst_dir, frame_names, s_i, e_i, second_subdir, second_ext):
     """Copy a clean frame range [s_i, e_i) into dst_dir, renumbering from 00001."""

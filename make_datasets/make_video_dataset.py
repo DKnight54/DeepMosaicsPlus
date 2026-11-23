@@ -28,7 +28,14 @@ from models import runmodel, loadmodel
 from models.yolo_mosaic_detector import YoloMosaicDetector
 import util.image_processing as impro
 from util import filt, util, mosaic, data, ffmpeg
-from tools.filter_subtitled_scenes import detect_single_image_subtitles, split_clean_runs, MIN_FRAMES as SUB_MIN_FRAMES
+from tools.filter_subtitled_scenes import (
+    detect_single_image_subtitles,
+    split_clean_runs,
+    find_fullframe_overlay_boxes,
+    crop_overlaps_boxes,
+    MIN_FRAMES as SUB_MIN_FRAMES,
+)
+from PIL import Image, PngImagePlugin
 
 
 opt.parser.add_argument('--datadir', type=str, default='your video dir', help='')
@@ -68,6 +75,11 @@ if opt.model_path.lower().endswith(('.pt', '.onnx')):
 else:
     net = loadmodel.bisenet(opt, 'roi')
 
+def _write_mask_with_meta(path, mask_gray, crop_ratio, med_crop_ratio):
+    meta = PngImagePlugin.PngInfo()
+    meta.add_text("crop_ratio", f"{crop_ratio:.5f}")
+    meta.add_text("med_crop_ratio", f"{med_crop_ratio:.5f}")
+    Image.fromarray(mask_gray).save(path, format="PNG", pnginfo=meta)
 
 def _next_available_startcnt(savedir, requested_start):
     max_id = requested_start - 1
@@ -272,6 +284,8 @@ def _process_one_video(videopath):
             for c in range(3):
                 positions[:, c] = filt.medfilt(positions[:, c], opt.medfilt_num)
 
+            overlay_boxes = find_fullframe_overlay_boxes(imgs)
+            dirty_flags = []
             cropped_pairs = []
             w_expand = random.uniform(0.45, 0.85)
             h_expand = random.uniform(0.30, 0.65)
@@ -287,14 +301,24 @@ def _process_one_video(videopath):
                     x, y, size = positions[tmp_cnt][0], positions[tmp_cnt][1], positions[tmp_cnt][2]
                     fallback_steps += 1
                 if size < opt.minsize // 2:
+                    dirty_flags.append(True)
+                    cropped_pairs.append(None)
                     continue
 
                 h_img, w_img = imgs[i].shape[:2]
                 y0, y1 = max(0, y - size), min(h_img, y + size)
                 x0, x1 = max(0, x - size), min(w_img, x + size)
                 if y1 <= y0 or x1 <= x0:
+                    dirty_flags.append(True)
+                    cropped_pairs.append(None)
                     continue
 
+                if i < len(overlay_boxes) and crop_overlaps_boxes((x0, y0, x1, y1), overlay_boxes[i]):
+                    dirty_flags.append(True)
+                    cropped_pairs.append(None)
+                    continue
+
+                dirty_flags.append(False)
                 local_sides.append(min(y1 - y0, x1 - x0))
                 img_out = impro.resize(imgs[i][y0:y1, x0:x1], opt.outsize, interpolation=cv2.INTER_CUBIC)
                 mask_out = impro.resize(masks[i][y0:y1, x0:x1], opt.outsize, interpolation=cv2.INTER_CUBIC)
@@ -313,14 +337,17 @@ def _process_one_video(videopath):
                 mask_out = np.maximum(mask_out, safe)
                 cropped_pairs.append((img_out, mask_out))
 
-
             min_keep = min(SUB_MIN_FRAMES, max(1, int(opt.time * opt.fps * 0.8)))
-            if len(cropped_pairs) < min_keep:
+            valid_imgs = [p[0] for p in cropped_pairs if p is not None]
+            if len(valid_imgs) < min_keep:
                 shutil.rmtree(os.path.join(opt.savedir, savecnt), ignore_errors=True)
                 continue
 
-            sub_flags = detect_single_image_subtitles([p[0] for p in cropped_pairs])
-            runs = split_clean_runs(sub_flags, min_keep) if any(sub_flags) else [(0, len(cropped_pairs))]
+            sub_flags = detect_single_image_subtitles(valid_imgs)
+            v_iter = iter(sub_flags)
+            combined_dirty = [True if d else next(v_iter) for d in dirty_flags]
+
+            runs = split_clean_runs(combined_dirty, min_keep) if any(combined_dirty) else [(0, len(cropped_pairs))]
             if not runs:
                 shutil.rmtree(os.path.join(opt.savedir, savecnt), ignore_errors=True)
                 continue
@@ -335,10 +362,20 @@ def _process_one_video(videopath):
                     cur_mask = os.path.join(opt.savedir, sub_cnt, 'mask')
                     util.makedirs(cur_orig)
                     util.makedirs(cur_mask)
+                run_ratios = [
+                    cropped_pairs[k][2] / max(1.0, cropped_pairs[k][3])
+                    for k in range(s_i, e_i)
+                ]
+                med_crop_ratio = float(np.median(run_ratios)) if run_ratios else 1.0
                 for out_i, src_i in enumerate(range(s_i, e_i), start=1):
                     impro.imwrite(os.path.join(cur_orig, f"{out_i:05d}.jpg"), cropped_pairs[src_i][0])
-                    impro.imwrite(os.path.join(cur_mask, f"{out_i:05d}.png"), cropped_pairs[src_i][1])
-                clips_created += 1
+                    cur_ratio = cropped_pairs[src_i][2] / max(1.0, cropped_pairs[src_i][3])
+                    _write_mask_with_meta(
+                        os.path.join(cur_mask, f"{out_i:05d}.png"),
+                        cropped_pairs[src_i][1],
+                        cur_ratio,
+                        med_crop_ratio,
+                    )
 
         with open(os.path.join(done_dir, _video_done_key(videopath)), 'w', encoding='utf-8') as f:
             f.write(f"ok clips={clips_created}\n")
