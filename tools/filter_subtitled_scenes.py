@@ -40,20 +40,28 @@ def _load_scaled_bgr(item, target_w=640):
         return cv2.resize(bgr, (target_w, sh), interpolation=cv2.INTER_AREA), ow, oh
     return bgr, ow, oh
 
+def _single_frame_text_cand(bgr_band, gray_band, k_dilate):
+    hsv = cv2.cvtColor(bgr_band, cv2.COLOR_BGR2HSV)
+    bright_core = (gray_band > 205) & (hsv[:, :, 1] < 105)
+    dilated = cv2.dilate(bright_core.astype(np.uint8), k_dilate, iterations=1) > 0
+    dark_outline = dilated & (~bright_core) & (gray_band < 85)
+    if float(np.mean(dark_outline)) <= 0.002:
+        return np.zeros_like(bright_core, dtype=bool)
+    return bright_core
+
+
 def has_subtitle_in_pair(orig_bgr, mos_bgr):
-    """Detect horizontal burned-in subtitle lines in origin_image absent in mosaic_image."""
+    """Detect horizontal burned-in subtitle lines in origin_image using paired diff OR outlined-text check."""
     h, _ = orig_bgr.shape[:2]
     y0 = int(h * BOTTOM_BAND_RATIO)
-
-    orig_gray = cv2.cvtColor(orig_bgr[y0:, :], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    band = orig_bgr[y0:, :]
+    orig_gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY).astype(np.float32)
     mos_gray = cv2.cvtColor(mos_bgr[y0:, :], cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-    if float(np.mean(np.abs(orig_gray - mos_gray) < 12.0)) < 0.78:
-        return False
-
-    bright_diff = (orig_gray > 225.0) & ((orig_gray - mos_gray) > 85.0)
-    return _has_horizontal_text_bar(bright_diff, orig_gray)
-
+    cand_diff = (orig_gray > 195.0) & ((orig_gray - mos_gray) > 65.0)
+    k_dil = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 5))
+    cand_outline = _single_frame_text_cand(band, orig_gray, k_dil)
+    return _has_horizontal_text_bar(cand_diff | cand_outline, orig_gray)
 
 def detect_single_image_subtitles(bgr_frames, min_persist=5):
     """
@@ -150,22 +158,20 @@ def find_fullframe_overlay_boxes(orig_items, mos_items=None, min_persist=5):
             wm_samples.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32))
 
         y_band = int(sh * BOTTOM_BAND_RATIO)
-        gray = cv2.cvtColor(bgr[y_band:, :], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        band = bgr[y_band:, :]
+        gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        cand_outline = _single_frame_text_cand(band, gray, k_dil)
         if mos_items is not None and idx < len(mos_items) and mos_items[idx] is not None:
             m_bgr, _, _ = _load_scaled_bgr(mos_items[idx], target_w=640)
             if m_bgr is None or m_bgr.shape[:2] != (sh, sw):
                 continue
             m_gray = cv2.cvtColor(m_bgr[y_band:, :], cv2.COLOR_BGR2GRAY).astype(np.float32)
-            if float(np.mean(np.abs(gray - m_gray) < 12.0)) < 0.78:
-                continue
-            cand = (gray > 225.0) & ((gray - m_gray) > 85.0)
+            cand_diff = (gray > 195.0) & ((gray - m_gray) > 65.0)
+            cand = cand_diff | cand_outline
         else:
-            hsv = cv2.cvtColor(bgr[y_band:, :], cv2.COLOR_BGR2HSV)
-            bright = (gray > 220) & (hsv[:, :, 1] < 95)
-            outline = (cv2.dilate(bright.astype(np.uint8), k_dil) > 0) & (~bright) & (gray < 75)
-            if float(np.mean(outline)) <= 0.003:
+            if not cand_outline.any():
                 continue
-            cand = bright
+            cand = cand_outline
 
         merged = cv2.morphologyEx(cand.astype(np.uint8), cv2.MORPH_CLOSE, k_line)
         gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
@@ -330,8 +336,6 @@ def process_real_pairs_folder(target_dir, prefix_filter="", dry_run=False, worke
         if not os.path.isdir(bdir) or not bucket.startswith("bucket_"):
             continue
         for clip in sorted(os.listdir(bdir)):
-            if "_dup" in clip or "_sub" in clip:
-                continue
             if prefixes and not clip.startswith(prefixes):
                 continue
             cdir = os.path.join(bdir, clip)
