@@ -943,8 +943,12 @@ class DatasetPrepWindow(QMainWindow):
         """Render final lines cleanly without clobbering mouse selection or spamming makedir."""
         if line.startswith('@@PROGRESS|'):
             self._handle_gui_progress(line)
+            if final:
+                self._live = False
             return
         if line.startswith('makedir:'):
+            if final:
+                self._live = False
             return
 
         sb = self.log.verticalScrollBar()

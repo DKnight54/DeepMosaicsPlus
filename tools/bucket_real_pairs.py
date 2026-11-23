@@ -94,7 +94,7 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
     names = names[:min(len(names), n_orig)]
     n = len(names)
     if n < min_frames or n == 0:
-        return None
+         return None, f"too few frames ({n} < {min_frames})"
 
     min_size = getattr(opt, 'min_mosaic_size', 100)
     pos = np.zeros((n, 3), dtype=np.int64)
@@ -136,7 +136,7 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
 
     valid = pos[:, 2] > 0
     if not valid.any():
-        return None
+        return None, "no valid mosaic detections in extracted frames"
 
     idx = np.arange(n)
     prev_i = np.maximum.accumulate(np.where(valid, idx, -1))
@@ -198,7 +198,8 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
         [(0, len(cropped_pairs))] if len(cropped_pairs) >= min_frames else []
     )
     if not runs:
-        return None
+        n_ovl = sum(dirty_flags)
+        return None, f"overlay overlap dropped {n_ovl}/{len(dirty_flags)} frames (0 clean runs >= {min_frames}f)"
 
     parent_dir = os.path.dirname(origin_dir)
     for r_idx, (s_i, e_i) in enumerate(runs):
@@ -225,7 +226,7 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
         'enlarged_pct': 100.0 * float(np.mean(np.array(sides) < outsize)),
         'resized_origin': size_mismatch,
         'sub_clips': len(runs),
-    }
+    }, None
 
 def _measure_postcrop_scene_pct(clip_dir, min_pct, max_pct, fallback_pct):
     """Measure mosaic block % on already-cropped origin_image/mosaic_image pairs."""
@@ -665,6 +666,7 @@ def main():
                 for scene_idx, sc in enumerate(scenes):
                     est_frames = int(round(sc['duration'] * known.fps))
                     if est_frames < known.min_frames:
+                        pair_logs.append(f"    scene {scene_idx:03d}: skipped (duration {sc['duration']:.1f}s -> ~{est_frames}f < min_frames={known.min_frames})")
                         continue
 
                     set_worker_status(slot, name, f"scene {scene_idx + 1}/{len(scenes)}")
@@ -685,7 +687,7 @@ def main():
                         warn = f" [WARN: frame mismatch orig={n_orig} vs mos={n_mosaic}]"
 
                     if not known.no_crop:
-                        stats = crop_pair_to_mosaic(
+                        stats, skip_reason = crop_pair_to_mosaic(
                             netM, opt, origin_dir, mosaic_dir, known.outsize,
                             min_frames=known.min_frames,
                             gpu_lock=gpu_lock,
@@ -693,9 +695,11 @@ def main():
                         )
                         if stats is None:
                             shutil.rmtree(stage_dir, ignore_errors=True)
+                            pair_logs.append(f"    scene {scene_idx:03d}: skipped ({skip_reason})")
                             continue
                         stage_dirs = sorted(glob.glob(f"{stage_dir}*"))
                         if not stage_dirs:
+                            pair_logs.append(f"    scene {scene_idx:03d}: skipped (no staging folders remained after crop)")
                             continue
                         sub_total = 0
                         for sd in stage_dirs:
@@ -710,6 +714,7 @@ def main():
                             if n_clean > 0:
                                 pair_results.append((sub_name, post_pct, bucket))
                         if sub_total == 0:
+                            pair_logs.append(f"    scene {scene_idx:03d}: skipped (post-crop subtitle filter left 0 runs >= {known.min_frames}f)")
                             continue
                         sub_note = f" -> {sub_total} clean sub-clip(s)" if sub_total > 1 else ""
                         pair_logs.append(
@@ -736,7 +741,7 @@ def main():
 
             with open(os.path.join(done_dir, f"{name}.done"), 'w', encoding='utf-8') as f:
                 f.write(f"ok scenes={len(pair_results)}\n")
-
+        except Exception as e: pair_logs.append(f"  [ERROR] {name}: {e}")
         finally:
             dt = time.time() - t0
             with state_lock:

@@ -192,10 +192,10 @@ def find_fullframe_overlay_boxes(orig_items, mos_items=None, min_persist=5):
                 j += 1
             if (j - i) >= min_persist:
                 merged_box = (
-                    min(b for f in range(i, j) for b in raw_sub_boxes[f]),
-                    min(b for f in range(i, j) for b in raw_sub_boxes[f]),
-                    max(b for f in range(i, j) for b in raw_sub_boxes[f]),
-                    max(b for f in range(i, j) for b in raw_sub_boxes[f]),
+                    min(b[0] for f in range(i, j) for b in raw_sub_boxes[f]),
+                    min(b[1] for f in range(i, j) for b in raw_sub_boxes[f]),
+                    max(b[2] for f in range(i, j) for b in raw_sub_boxes[f]),
+                    max(b[3] for f in range(i, j) for b in raw_sub_boxes[f]),
                 )
                 for k in range(max(0, i - 2), min(n, j + 2)):
                     persist_boxes[k].append(merged_box)
@@ -209,27 +209,40 @@ def find_fullframe_overlay_boxes(orig_items, mos_items=None, min_persist=5):
         sh, sw = stack.shape[1], stack.shape[2]
         sx, sy = orig_w / float(sw), orig_h / float(sh)
         t_std = np.std(stack, axis=0)
-        mean_img = np.mean(stack, axis=0)
-        gx_m = np.abs(cv2.Sobel(mean_img, cv2.CV_32F, 1, 0, ksize=3))
-        gy_m = np.abs(cv2.Sobel(mean_img, cv2.CV_32F, 0, 1, ksize=3))
-        static_edge = ((t_std < 3.5) & ((gx_m + gy_m) > 55.0)).astype(np.uint8)
-        border = np.zeros_like(static_edge)
-        bh_m, bw_m = int(0.18 * sh), int(0.18 * sw)
-        border[:bh_m, :] = 1
-        border[sh - bh_m:, :] = 1
-        border[:, :bw_m] = 1
-        border[:, sw - bw_m:] = 1
-        wm_mask = cv2.morphologyEx(static_edge & border, cv2.MORPH_CLOSE, k_line)
-        num_lbl, _, stats, _ = cv2.connectedComponentsWithStats(wm_mask)
-        for lbl in range(1, num_lbl):
-            x, y, bw, bh, area = stats[lbl]
-            if bw >= 14 and bh >= 6 and area >= 50:
-                wm_boxes.append((
-                    max(0, int(round((x - 4) * sx))),
-                    max(0, int(round((y - 4) * sy))),
-                    min(orig_w, int(round((x + bw + 4) * sx))),
-                    min(orig_h, int(round((y + bh + 4) * sy))),
-                ))
+        # On single-stream videos, only look for frozen overlays when camera/scene has motion (not locked tripod)
+        if mos_items is not None or float(np.mean(t_std)) >= 4.5:
+            mean_img = np.mean(stack, axis=0)
+            gx_m = np.abs(cv2.Sobel(mean_img, cv2.CV_32F, 1, 0, ksize=3))
+            gy_m = np.abs(cv2.Sobel(mean_img, cv2.CV_32F, 0, 1, ksize=3))
+            static_edge = ((t_std < 3.5) & ((gx_m + gy_m) > 55.0)).astype(np.uint8)
+            border = np.zeros_like(static_edge)
+            bh_m, bw_m = int(0.18 * sh), int(0.18 * sw)
+            border[:bh_m, :] = 1
+            border[sh - bh_m:, :] = 1
+            border[:, :bw_m] = 1
+            border[:, sw - bw_m:] = 1
+            wm_mask = cv2.morphologyEx(static_edge & border, cv2.MORPH_CLOSE, k_line)
+            num_lbl, _, stats, _ = cv2.connectedComponentsWithStats(wm_mask)
+            # Sample one paired mosaic frame if available to confirm overlay isn't shared background
+            ref_diff = None
+            if mos_items is not None:
+                mid_i = len(orig_items) // 2
+                o_ref, _, _ = _load_scaled_bgr(orig_items[mid_i], target_w=640)
+                m_ref, _, _ = _load_scaled_bgr(mos_items[mid_i], target_w=640)
+                if o_ref is not None and m_ref is not None and o_ref.shape == m_ref.shape:
+                    ref_diff = np.mean(np.abs(o_ref.astype(np.float32) - m_ref.astype(np.float32)), axis=2)
+
+            for lbl in range(1, num_lbl):
+                x, y, bw, bh, area = stats[lbl]
+                if (14 <= bw <= int(0.38 * sw)) and (6 <= bh <= int(0.12 * sh)) and area >= 50:
+                    if ref_diff is not None and float(np.mean(ref_diff[y:y + bh, x:x + bw])) < 18.0:
+                        continue
+                    wm_boxes.append((
+                        max(0, int(round((x - 4) * sx))),
+                        max(0, int(round((y - 4) * sy))),
+                        min(orig_w, int(round((x + bw + 4) * sx))),
+                        min(orig_h, int(round((y + bh + 4) * sy))),
+                    ))
 
     return [persist_boxes[idx] + wm_boxes for idx in range(n)]
 
