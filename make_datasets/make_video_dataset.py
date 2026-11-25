@@ -4,6 +4,7 @@ import shutil
 import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import traceback
 
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -335,7 +336,12 @@ def _process_one_video(videopath):
                 safe = np.zeros_like(dilated)
                 safe[mh:opt.outsize - mh, mh:opt.outsize - mh] = dilated[mh:opt.outsize - mh, mh:opt.outsize - mh]
                 mask_out = np.maximum(mask_out, safe)
-                cropped_pairs.append((img_out, mask_out))
+                cropped_pairs.append((
+                    img_out,
+                    mask_out,
+                    float(min(y1 - y0, x1 - x0)),
+                    float(min(h_img, w_img)),
+                ))
 
             min_keep = min(SUB_MIN_FRAMES, max(1, int(opt.time * opt.fps * 0.8)))
             valid_imgs = [p[0] for p in cropped_pairs if p is not None]
@@ -376,6 +382,7 @@ def _process_one_video(videopath):
                         cur_ratio,
                         med_crop_ratio,
                     )
+                clips_created += 1
 
         with open(os.path.join(done_dir, _video_done_key(videopath)), 'w', encoding='utf-8') as f:
             f.write(f"ok clips={clips_created}\n")
@@ -383,6 +390,7 @@ def _process_one_video(videopath):
     except Exception as e:
         print(f"Error processing '{vname}': {e}", flush=True)
         util.writelog(os.path.join(opt.savedir, 'opt.txt'), videopath + '\n' + str(e))
+        traceback.print_exc()
     finally:
         if os.path.isdir(worker_tmp):
             shutil.rmtree(worker_tmp, ignore_errors=True)

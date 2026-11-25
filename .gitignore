@@ -202,6 +202,8 @@ result/
 *.bat
 tools/.dataset_prep_config.json
 PROJECT_CONTEXT.md
+_real_pair_align_qc/
+
 
 
 

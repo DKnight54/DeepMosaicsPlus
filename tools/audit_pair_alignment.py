@@ -1,42 +1,62 @@
 import os
 import shutil
+import argparse
 import cv2
 import numpy as np
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 MIN_FRAMES = 100
-BORDER_RATIO = 0.14  # Outer 14% ring around crop is un-mosaicked background
+BORDER_RATIO = 0.15  # Outer 15% ring is un-mosaicked background
+SHIFTS = (-3, -2, -1, 0, 1, 2, 3)
 
 
-def _border_pixels(bgr):
-    """Extract flattened float32 outer border ring pixels (outside central mosaic area)."""
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    h, w = gray.shape
-    bh = max(8, int(h * BORDER_RATIO))
-    bw = max(8, int(w * BORDER_RATIO))
-    top = gray[:bh, :].ravel()
-    bot = gray[h - bh:, :].ravel()
-    left = gray[bh:h - bh, :bw].ravel()
-    right = gray[bh:h - bh, w - bw:].ravel()
-    return np.concatenate([top, bot, left, right])
+def _norm_border_vec(bgr, size=144):
+    """Downsample to 144x144 and extract z-normalized outer border ring (immune to codec gamma/gain)."""
+    small = cv2.resize(bgr, (size, size), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    b = max(4, int(round(size * BORDER_RATIO)))
+    ring = np.concatenate([
+        gray[:b, :].ravel(),
+        gray[size - b:, :].ravel(),
+        gray[b:size - b, :b].ravel(),
+        gray[b:size - b, size - b:].ravel(),
+    ])
+    std = float(np.std(ring))
+    if std < 2.0:
+        return None
+    return (ring - float(np.mean(ring))) / std
 
 
-def _mean_shift_error(orig_borders, mos_borders, shift):
-    """Mean L1 border error for shift in (-1, 0, +1). +1 means orig[t+1] matches mos[t]."""
-    n = min(len(orig_borders), len(mos_borders))
-    if shift == 0:
-        pairs = [(i, i) for i in range(n)]
-    elif shift == 1:
-        pairs = [(i + 1, i) for i in range(n - 1)]
-    else:
-        pairs = [(i, i + 1) for i in range(n - 1)]
-    if not pairs:
-        return 999.0
-    errs = [float(np.mean(np.abs(orig_borders[oi] - mos_borders[mi]))) for oi, mi in pairs]
-    return float(np.mean(errs))
+def _save_anaglyph_qc(orig_path, mos_path, shifted_orig_path, qc_png, label):
+    """Save Red=Orig / Cyan=Mos anaglyph at shift=0 vs best_shift so 1-frame ghosting is unmistakable."""
+    oi = cv2.resize(cv2.imread(orig_path), (384, 384))
+    mi = cv2.resize(cv2.imread(mos_path), (384, 384))
+    oi_s = cv2.resize(cv2.imread(shifted_orig_path), (384, 384))
 
-def _audit_one_clip(item, apply_fix):
+    def anaglyph(a, b):
+        # BGR: Blue+Green from b (Cyan), Red from a (Red) -> zero ghosting = pure grayscale/natural color
+        out = np.zeros_like(a)
+        out[:, :, 0] = b[:, :, 0]
+        out[:, :, 1] = b[:, :, 1]
+        out[:, :, 2] = a[:, :, 2]
+        return out
+
+    p0 = anaglyph(oi, mi)
+    p1 = anaglyph(oi_s, mi)
+    d0 = cv2.applyColorMap(np.clip(np.abs(oi.astype(np.int16) - mi.astype(np.int16)).mean(axis=2) * 4, 0, 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+    d1 = cv2.applyColorMap(np.clip(np.abs(oi_s.astype(np.int16) - mi.astype(np.int16)).mean(axis=2) * 4, 0, 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+
+    cv2.putText(p0, "Shift 0f Anaglyph (Ghost=Slip)", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(p1, f"{label} Anaglyph (Aligned)", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 140), 1, cv2.LINE_AA)
+    cv2.putText(d0, "Shift 0f Diff x4", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(d1, f"{label} Diff x4", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+
+    os.makedirs(os.path.dirname(qc_png), exist_ok=True)
+    cv2.imwrite(qc_png, np.vstack([np.hstack([p0, p1]), np.hstack([d0, d1])]))
+
+
+def _audit_one_clip(item, apply_fix, qc_dir):
     bucket, clip, cdir, orig_dir, mos_dir = item
     o_names = sorted(f for f in os.listdir(orig_dir) if f.lower().endswith(".jpg"))
     m_names = sorted(f for f in os.listdir(mos_dir) if f.lower().endswith(".jpg"))
@@ -44,37 +64,88 @@ def _audit_one_clip(item, apply_fix):
     if n < MIN_FRAMES:
         return None
 
-    # Sample up to 24 evenly spaced frames across the clip for fast border comparison
-    step = max(1, n // 24)
-    sample_idx = list(range(0, n, step))[:24]
-    o_borders, m_borders = [], []
-    for idx in sample_idx:
+    o_vecs, m_vecs = [], []
+    for idx in range(n):
         oi = cv2.imread(os.path.join(orig_dir, o_names[idx]))
         mi = cv2.imread(os.path.join(mos_dir, m_names[idx]))
         if oi is None or mi is None or oi.shape != mi.shape:
             return None
-        o_borders.append(_border_pixels(oi))
-        m_borders.append(_border_pixels(mi))
+        o_vecs.append(_norm_border_vec(oi))
+        m_vecs.append(_norm_border_vec(mi))
 
-    err_0 = _mean_shift_error(o_borders, m_borders, 0)
-    err_p1 = _mean_shift_error(o_borders, m_borders, 1)
-    err_m1 = _mean_shift_error(o_borders, m_borders, -1)
+    # Compute motion weights so static holds don't dilute motion-frame shift detection
+    motion = np.zeros(n, dtype=np.float32)
+    for t in range(1, n):
+        if o_vecs[t] is not None and o_vecs[t - 1] is not None:
+            motion[t] = float(np.mean(np.abs(o_vecs[t] - o_vecs[t - 1])))
+    motion[0] = motion[1] if n > 1 else 1.0
+    weights = np.clip(motion, 0.05, None)
 
-    best_shift, best_err = (1, err_p1) if err_p1 < err_m1 else (-1, err_m1)
-    is_shifted = (err_0 > 7.0) and (best_err < err_0 * 0.72) and (best_err < 12.0)
+    # Evaluate true frame-by-frame shift s in [-3..+3]: compare orig[t + s] vs mos[t]
+    shift_scores = {}
+    for s in SHIFTS:
+        num, den = 0.0, 0.0
+        for t in range(max(0, -s), min(n, n - s)):
+            ov, mv = o_vecs[t + s], m_vecs[t]
+            if ov is not None and mv is not None:
+                corr = float(np.mean(ov * mv))
+                w = float(weights[t])
+                num += corr * w
+                den += w
+        shift_scores[s] = (num / den) if den > 0 else 0.0
 
-    if not is_shifted:
-        return ("ok", err_0, None)
+    # Also scan 60-frame sliding windows to catch mid-clip VFR/dropped-frame drift
+    win = 60
+    win_best_shifts = []
+    for start in range(0, n - win + 1, win // 2):
+        best_ws, best_wc = 0, -1.0
+        for s in SHIFTS:
+            cs = []
+            for t in range(max(start, -s), min(start + win, n - s)):
+                if o_vecs[t + s] is not None and m_vecs[t] is not None:
+                    cs.append(float(np.mean(o_vecs[t + s] * m_vecs[t])))
+            if cs:
+                mc = float(np.mean(cs))
+                if mc > best_wc:
+                    best_wc, best_ws = mc, s
+        win_best_shifts.append(best_ws)
 
-    msg = (
-        f"[SHIFT {best_shift:+d}f] {bucket}/{clip}: "
-        f"err0={err_0:.2f} -> err({best_shift:+d})={best_err:.2f}"
-    )
+    corr_0 = shift_scores[0]
+    best_shift = max(SHIFTS, key=lambda s: shift_scores[s])
+    best_corr = shift_scores[best_shift]
+    has_vfr_drift = len(set(win_best_shifts)) > 1 and any(s != 0 for s in win_best_shifts)
 
+    is_global_shift = (best_shift != 0) and ((best_corr - corr_0) >= 0.035) and (best_corr >= 0.80)
+    is_corrupt_pair = (best_corr < 0.78)
+
+    if not is_global_shift and not has_vfr_drift and not is_corrupt_pair:
+        return ("ok", corr_0, None)
+
+    # Pick highest-motion frame for visual QC proof
+    peak_t = int(np.clip(np.argmax(motion), abs(best_shift) + 1, n - abs(best_shift) - 2))
+    if qc_dir:
+        qc_png = os.path.join(qc_dir, f"{bucket}__{clip}__shift{best_shift:+d}.png")
+        _save_anaglyph_qc(
+            os.path.join(orig_dir, o_names[peak_t]),
+            os.path.join(mos_dir, m_names[peak_t]),
+            os.path.join(orig_dir, o_names[peak_t + best_shift]),
+            qc_png,
+            f"Shift {best_shift:+d}f",
+        )
+
+    if is_corrupt_pair:
+        return ("corrupt", corr_0, f"[LOW_CORR] {bucket}/{clip}: best_corr={best_corr:.3f} (shift={best_shift:+d}f)")
+
+    if not is_global_shift and has_vfr_drift:
+        return ("drift", corr_0, f"[VFR_DRIFT] {bucket}/{clip}: corr0={corr_0:.3f}, window_shifts={win_best_shifts}")
+
+    msg = f"[SHIFT {best_shift:+d}f] {bucket}/{clip}: corr0={corr_0:.3f} -> corr({best_shift:+d})={best_corr:.3f}"
     if apply_fix:
-        # shift == +1: drop orig[0] & mos[-1]; shift == -1: drop mos[0] & orig[-1]
-        o_slice = o_names[1:n] if best_shift == 1 else o_names[:n - 1]
-        m_slice = m_names[:n - 1] if best_shift == 1 else m_names[1:n]
+        # best_shift > 0 means orig[t + s] matches mos[t] -> drop first s frames of orig
+        # best_shift < 0 means orig[t - |s|] matches mos[t] -> drop first |s| frames of mos
+        s = best_shift
+        o_slice = o_names[s:n] if s > 0 else o_names[:n + s]
+        m_slice = m_names[:n - s] if s > 0 else m_names[-s:n]
         tmp_o = os.path.join(cdir, "_tmp_orig")
         tmp_m = os.path.join(cdir, "_tmp_mos")
         os.makedirs(tmp_o, exist_ok=True)
@@ -88,14 +159,13 @@ def _audit_one_clip(item, apply_fix):
         os.replace(tmp_m, mos_dir)
         msg += " -> FIXED"
 
-    return ("shifted", err_0, msg)
-
+    return ("shifted", corr_0, msg)
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Audit and optionally fix +/-1 frame alignment slips in real_pair.")
+    parser = argparse.ArgumentParser(description="Dense frame-exact +/-3f alignment & VFR drift auditor for real_pair.")
     parser.add_argument("--real_pairs_dir", default=os.path.join("datasets", "real_pair"))
-    parser.add_argument("--fix", action="store_true", help="Shift and renumber misaligned clips in-place")
+    parser.add_argument("--qc_dir", default="", help="Optional folder to save Red/Cyan anaglyph visual proof PNGs")
+    parser.add_argument("--fix", action="store_true", help="Shift and renumber globally-shifted clips in-place")
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
 
@@ -113,21 +183,26 @@ def main():
             if os.path.isdir(orig_dir) and os.path.isdir(mos_dir):
                 candidates.append((bucket, clip, cdir, orig_dir, mos_dir))
 
-    ok_cnt = shifted_cnt = 0
+    counts = {"ok": 0, "shifted": 0, "drift": 0, "corrupt": 0}
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = [pool.submit(_audit_one_clip, item, args.fix) for item in candidates]
+        futures = [pool.submit(_audit_one_clip, item, args.fix, args.qc_dir) for item in candidates]
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Auditing alignment", unit="clip"):
             res = fut.result()
             if res is None:
                 continue
             status, _, msg = res
-            if status == "shifted":
-                shifted_cnt += 1
+            counts[status] += 1
+            if msg:
                 tqdm.write(msg)
-            else:
-                ok_cnt += 1
 
-    print(f"\nAlignment Summary: {ok_cnt} aligned clip(s), {shifted_cnt} +/-1f shifted clip(s) detected.")
+    print(
+        f"\nAlignment Summary: {counts['ok']} aligned, "
+        f"{counts['shifted']} global shift (+/-1..3f), "
+        f"{counts['drift']} mid-clip VFR drift, "
+        f"{counts['corrupt']} low-corr/corrupt."
+    )
+    if args.qc_dir and (counts["shifted"] + counts["drift"] + counts["corrupt"]) > 0:
+        print(f"Visual Red/Cyan anaglyph QC strips saved -> {args.qc_dir}")
 
 
 if __name__ == "__main__":
