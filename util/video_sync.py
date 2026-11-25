@@ -6,7 +6,78 @@ import numpy as np
 
 STD_RATES = (24000 / 1001, 24.0, 25.0, 30000 / 1001, 30.0, 48.0, 50.0, 60000 / 1001, 60.0)
 VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m4v", ".webm")
+_HWACCEL_CACHE = None
 
+
+def detect_hw_decoders():
+    """Probe available FFmpeg hardware decoders & Windows GPU adapters.
+    Returns dict: {"choices": [("Auto (Hardware)", "auto"), ...], "summary": str}.
+    """
+    global _HWACCEL_CACHE
+    if _HWACCEL_CACHE is not None:
+        return _HWACCEL_CACHE
+    kw = {"creationflags": 0x08000000} if os.name == "nt" else {}
+    avail = set()
+    try:
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-hwaccels"], capture_output=True, text=True, timeout=4, **kw).stdout
+        for line in out.splitlines():
+            tok = line.strip().lower()
+            if tok in ("d3d11va", "cuda", "dxva2", "videotoolbox", "vaapi", "qsv"):
+                avail.add(tok)
+    except Exception:
+        pass
+
+    gpus = []
+    if os.name == "nt":
+        try:
+            ps = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_VideoController).Name"],
+                capture_output=True, text=True, timeout=4, **kw
+            ).stdout
+            gpus = [g.strip() for g in ps.splitlines() if g.strip()]
+        except Exception:
+            pass
+
+    choices = [("Auto (Hardware)", "auto")]
+    if "d3d11va" in avail:
+        choices.append(("D3D11VA (Direct3D / APU+GPU)", "d3d11va"))
+        if len(gpus) > 1:
+            choices.append((f"D3D11VA Adapter 1 ({gpus[1][:24]})", "d3d11va:1"))
+    if "cuda" in avail:
+        choices.append(("CUDA (NVIDIA NVDEC)", "cuda"))
+    if "videotoolbox" in avail:
+        choices.append(("VideoToolbox (Apple)", "videotoolbox"))
+    if "vaapi" in avail:
+        choices.append(("VAAPI (Linux)", "vaapi"))
+    choices.append(("CPU Software (Fallback)", "cpu"))
+
+    hw_list = [k.upper() for k in ("d3d11va", "cuda", "videotoolbox", "vaapi") if k in avail]
+    gpu_note = f" | GPUs: {', '.join(gpus)}" if gpus else ""
+    summary = f"HW decode: {', '.join(hw_list) if hw_list else 'CPU only'}{gpu_note}"
+    _HWACCEL_CACHE = {"choices": choices, "summary": summary, "avail": avail}
+    return _HWACCEL_CACHE
+
+
+def ffmpeg_hwdecode_args(hwaccel="auto"):
+    """Return FFmpeg input flags before -i for the chosen hwaccel mode."""
+    mode = (hwaccel or "auto").strip().lower()
+    if mode == "cpu":
+        return []
+    info = detect_hw_decoders()
+    avail = info["avail"]
+    if mode == "auto":
+        for cand in ("d3d11va", "cuda", "videotoolbox", "vaapi"):
+            if cand in avail:
+                mode = cand
+                break
+        else:
+            return []
+    if mode.startswith("d3d11va:"):
+        dev = mode.split(":", 1)[1]
+        return ["-hwaccel", "d3d11va", "-hwaccel_device", dev]
+    if mode in avail:
+        return ["-hwaccel", mode]
+    return []
 
 def extract_robust_fingerprint(gray_hw, w=128, h=72):
     roi = gray_hw[int(h * 0.12):int(h * 0.74), int(w * 0.04):int(w * 0.96)]
@@ -19,7 +90,7 @@ def extract_robust_fingerprint(gray_hw, w=128, h=72):
     return (feat - float(np.mean(feat))) / std if std > 1e-3 else np.zeros_like(feat)
 
 
-def index_video_ffmpeg(video_path, cache_dir=None, target_fps=6.0, w=128, h=72):
+def index_video_ffmpeg(video_path, cache_dir=None, target_fps=6.0, w=128, h=72, hwaccel="auto"):
     st = os.stat(video_path)
     cache_file = None
     if cache_dir:
@@ -30,20 +101,29 @@ def index_video_ffmpeg(video_path, cache_dir=None, target_fps=6.0, w=128, h=72):
             return d["mat"], d["ts"], float(d["src_fps"])
 
     src_fps = probe_cfr_fps(video_path, halve_high_fps=False)
-    cmd = ["ffmpeg", "-v", "error", "-i", video_path, "-vf", f"fps={target_fps},scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "gray", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     frame_bytes = w * h
-    feats, timestamps, idx = [], [], 0
-    while True:
-        raw = proc.stdout.read(frame_bytes)
-        if len(raw) < frame_bytes:
-            break
-        gray = np.frombuffer(raw, dtype=np.uint8).reshape((h, w)).astype(np.float32)
-        feats.append(extract_robust_fingerprint(gray, w=w, h=h))
-        timestamps.append(idx / target_fps)
-        idx += 1
-    proc.stdout.close()
-    proc.wait()
+
+    def _decode_stream(use_hw=True):
+        hw_flags = ffmpeg_hwdecode_args(hwaccel) if use_hw else []
+        cmd = ["ffmpeg", "-v", "error", *hw_flags, "-i", video_path,
+               "-vf", f"fps={target_fps},scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "gray", "-"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        out_feats, out_ts, idx = [], [], 0
+        while True:
+            raw = proc.stdout.read(frame_bytes)
+            if len(raw) < frame_bytes:
+                break
+            gray = np.frombuffer(raw, dtype=np.uint8).reshape((h, w)).astype(np.float32)
+            out_feats.append(extract_robust_fingerprint(gray, w=w, h=h))
+            out_ts.append(idx / target_fps)
+            idx += 1
+        proc.stdout.close()
+        proc.wait()
+        return out_feats, out_ts
+
+    feats, timestamps = _decode_stream(use_hw=True)
+    if not feats and (hwaccel or "auto").lower() != "cpu":
+        feats, timestamps = _decode_stream(use_hw=False)
 
     mat = np.ascontiguousarray(np.vstack(feats), dtype=np.float32) if feats else np.empty((0, 1), dtype=np.float32)
     ts_arr = np.array(timestamps, dtype=np.float64)
@@ -124,11 +204,11 @@ def discover_groups(censored_dir, uncensored_dir):
     return groups
 
 
-def match_group(group_label, cen_paths, unc_paths, qc_dir, export_dir=None, chunk_sec=5.0, min_corr=0.78, target_fps=6.0):
+def match_group(group_label, cen_paths, unc_paths, qc_dir, export_dir=None, chunk_sec=5.0, min_corr=0.78, target_fps=6.0, hwaccel="auto"):
     cache_dir = os.path.join(qc_dir, "_index_cache")
     unc_indexed = []
     for u in unc_paths:
-        u_mat, u_ts, u_fps = index_video_ffmpeg(u, cache_dir=cache_dir, target_fps=target_fps)
+        u_mat, u_ts, u_fps = index_video_ffmpeg(u, cache_dir=cache_dir, target_fps=target_fps, hwaccel=hwaccel)
         if len(u_mat) > 0:
             unc_indexed.append((u, u_mat, u_ts, u_fps))
     if not unc_indexed:
@@ -137,7 +217,7 @@ def match_group(group_label, cen_paths, unc_paths, qc_dir, export_dir=None, chun
     stride, mid_k, sample_ks = max(6, win // 2), win // 2, list(range(0, win, 2))
     out_scenes = []
     for c_path in cen_paths:
-        c_mat, c_ts, c_fps = index_video_ffmpeg(c_path, cache_dir=cache_dir, target_fps=target_fps)
+        c_mat, c_ts, c_fps = index_video_ffmpeg(c_path, cache_dir=cache_dir, target_fps=target_fps, hwaccel=hwaccel)
         if len(c_mat) < win:
             continue
         n_dim = int(c_mat.shape[1])
@@ -259,7 +339,7 @@ def _border_zvec(bgr, size=144, border_ratio=0.15):
     return (ring - float(np.mean(ring))) / std
 
 
-def align_pair_folders_dtw(orig_dir, mos_dir, max_band=3, min_mean_corr=0.80):
+def align_pair_folders_dtw(orig_dir, mos_dir, max_band=3, min_mean_corr=0.80, relink_files=True):
     """Monotonic Banded DTW alignment on full-frame extracted JPGs before ROI cropping.
     Repairs both constant +/-1..3f offsets AND mid-clip VFR/pulldown slips in-place.
     Returns (ok: bool, mean_corr: float, info_str: str).
@@ -268,7 +348,7 @@ def align_pair_folders_dtw(orig_dir, mos_dir, max_band=3, min_mean_corr=0.80):
     m_names = sorted(f for f in os.listdir(mos_dir) if f.lower().endswith(".jpg"))
     no, nm = len(o_names), len(m_names)
     if no < 20 or nm < 20:
-        return False, 0.0, "too_few_frames"
+        return False, 0.0, "too_few_frames", []
 
     o_vecs = [_border_zvec(cv2.imread(os.path.join(orig_dir, f))) for f in o_names]
     m_vecs = [_border_zvec(cv2.imread(os.path.join(mos_dir, f))) for f in m_names]
@@ -316,7 +396,7 @@ def align_pair_folders_dtw(orig_dir, mos_dir, max_band=3, min_mean_corr=0.80):
                 best_end = (i, j)
 
     if best_end is None:
-        return False, 0.0, "no_valid_dtw_path"
+        return False, 0.0, "no_valid_dtw_path", []
 
     path = []
     ci, cj = best_end
@@ -330,7 +410,10 @@ def align_pair_folders_dtw(orig_dir, mos_dir, max_band=3, min_mean_corr=0.80):
     mean_corr = float(np.mean(corrs)) if corrs else 0.0
     shifts = [i - j for i, j in path]
     if mean_corr < min_mean_corr:
-        return False, mean_corr, f"low_corr={mean_corr:.3f}"
+        return False, mean_corr, f"low_corr={mean_corr:.3f}", []
+    info_str = f"dtw_corr={mean_corr:.3f} shift_range=[{min(shifts):+d}..{max(shifts):+d}f]"
+    if not relink_files:
+        return True, mean_corr, info_str, path
 
     # Rewrite aligned sequence atomically via temp staging
     tmp_o = orig_dir + "_dtw"
@@ -352,4 +435,4 @@ def align_pair_folders_dtw(orig_dir, mos_dir, max_band=3, min_mean_corr=0.80):
     os.rmdir(tmp_o)
     os.rmdir(tmp_m)
 
-    return True, mean_corr, f"dtw_corr={mean_corr:.3f} shift_range=[{min(shifts):+d}..{max(shifts):+d}f]"
+    return True, mean_corr, f"dtw_corr={mean_corr:.3f} shift_range=[{min(shifts):+d}..{max(shifts):+d}f]", path

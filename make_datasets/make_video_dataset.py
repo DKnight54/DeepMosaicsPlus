@@ -38,7 +38,8 @@ from tools.filter_subtitled_scenes import (
 )
 from PIL import Image, PngImagePlugin
 from util import filt, util, mosaic, data, ffmpeg
-from util.video_sync import probe_cfr_fps
+from util.video_sync import probe_cfr_fps, ffmpeg_hwdecode_args
+import subprocess
 
 
 opt.parser.add_argument('--datadir', type=str, default='your video dir', help='')
@@ -60,6 +61,8 @@ opt.parser.add_argument('--no_resume', action='store_true',
 opt.parser.add_argument('--gui_progress', action='store_true',
                         help='emit machine-readable @@PROGRESS lines and suppress tqdm bars')
 opt.parser.add_argument('--fps', type=int, default=0, help='target FPS (0 = auto native CFR, >0 = manual override)')
+opt.parser.add_argument('--hwaccel', type=str, default='auto', help='FFmpeg hardware decoder manual override')
+
 
 opt = opt.getparse()
 
@@ -193,36 +196,49 @@ def _process_one_video(videopath):
             timestamps = []
             fps, endtime, height, width = ffmpeg.get_video_infos(videopath)
             short_name = (vname[:28] + '...') if len(vname) > 31 else vname
-            max_cut = int((endtime - opt.time) / opt.interval)
-            cut_points = range(0, max(1, max_cut)) if endtime >= opt.time else range(0)
+            sw = min(640, max(64, int(width or 640)))
+            sh = max(32, int(round(float(height or 360) * (sw / float(max(1, width or 640))))) // 2 * 2)
+            scale_ratio = float(max(1, width or sw)) / float(sw)
 
+            def _scan_1fps(use_hw=True):
+                hw_flags = ffmpeg_hwdecode_args(getattr(opt, 'hwaccel', 'auto')) if use_hw else []
+                cmd = ['ffmpeg', '-v', 'error', *hw_flags, '-i', videopath,
+                       '-vf', f'fps=1,scale={sw}:{sh}', '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-']
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                        creationflags=0x08000000 if os.name == 'nt' else 0)
+                fbytes = sw * sh * 3
+                buf = []
+                while True:
+                    raw = proc.stdout.read(fbytes)
+                    if len(raw) < fbytes:
+                        break
+                    buf.append(np.frombuffer(raw, dtype=np.uint8).reshape((sh, sw, 3)).copy())
+                proc.stdout.close()
+                proc.wait()
+                return buf
+
+            scan_frames = _scan_1fps(use_hw=True)
+            if not scan_frames and getattr(opt, 'hwaccel', 'auto').lower() != 'cpu':
+                scan_frames = _scan_1fps(use_hw=False)
+
+            max_cut = max(0, (len(scan_frames) - opt.time) // max(1, opt.interval))
             pbar = tqdm(
-                cut_points,
+                range(max_cut),
                 desc=f"Scanning {short_name}",
                 unit="clip",
                 leave=False,
                 disable=not show_inner_pbar,
             )
-            for cut_point in pbar:
-                stamp = util.second2stamp(cut_point * opt.interval)
-                if len(cut_points) > 0:
-                    _set_worker_status(slot, vname, "scan", int(100 * cut_point / len(cut_points)))
+            for cut_idx in pbar:
+                t0_sec = cut_idx * opt.interval
+                stamp = util.second2stamp(t0_sec)
+                if max_cut > 0:
+                    _set_worker_status(slot, vname, "scan", int(100 * cut_idx / max_cut))
                 if show_inner_pbar:
                     pbar.set_postfix_str(f"t={stamp} hits={len(timestamps)}", refresh=False)
-                _clean_worker_temp(worker_tmp)
-                ffmpeg.video2image(
-                    videopath,
-                    os.path.join(worker_tmp, '%05d.' + opt.tempimage_type),
-                    fps=1,
-                    start_time=stamp,
-                    last_time=util.second2stamp(opt.time),
-                )
-                imagepaths = sorted(util.Traversal(worker_tmp))
                 cnt = 0
-                for i in range(min(opt.time, len(imagepaths))):
-                    img = impro.imread(imagepaths[i])
-                    if img is None:
-                        continue
+                for off in range(opt.time):
+                    img = scan_frames[t0_sec + off]
                     with gpu_lock:
                         if isinstance(net, YoloMosaicDetector):
                             mask, _, _, _ = net.detect(img, opt)
@@ -233,7 +249,7 @@ def _process_one_video(videopath):
                     if not opt.all_mosaic_area:
                         mask = impro.find_mostlikely_ROI(mask)
                     x, y, size, area = impro.boundingSquare(mask, Ex_mul=1)
-                    if area > opt.minmaskarea and size > opt.minsize and impro.Q_lapulase(img) > opt.quality:
+                    if (area * (scale_ratio ** 2)) > opt.minmaskarea and (size * scale_ratio) > opt.minsize and impro.Q_lapulase(img) > opt.quality:
                         cnt += 1
                 if cnt >= opt.time * opt.scene_accept_ratio:
                     timestamps.append(stamp)
@@ -260,26 +276,26 @@ def _process_one_video(videopath):
             )
 
             imagepaths = sorted(util.Traversal(worker_tmp))
-            imgs, masks = [], []
+            raw_imgs = [im for p in imagepaths if (im := impro.imread(p)) is not None]
+            imgs, masks, positions = [], [], []
             ex_mul = random.uniform(1.65, 2.25)
-            positions = []
-            for imagepath in imagepaths:
-                img = impro.imread(imagepath)
-                if img is None:
-                    continue
+            for b0 in range(0, len(raw_imgs), 8):
+                chunk = raw_imgs[b0:b0 + 8]
                 with gpu_lock:
-                    if isinstance(net, YoloMosaicDetector):
-                        mask, _, _, _ = net.detect(img, opt)
-                        if mask is None:
-                            mask = np.zeros(img.shape[:2], dtype=np.uint8)
+                    if isinstance(net, YoloMosaicDetector) and hasattr(net, 'detect_batch'):
+                        dets = net.detect_batch(chunk, opt)
+                        chunk_masks = [m if m is not None else np.zeros(im.shape[:2], dtype=np.uint8) for im, (m, _, _, _) in zip(chunk, dets)]
+                    elif isinstance(net, YoloMosaicDetector):
+                        chunk_masks = [m if (m := net.detect(im, opt)[0]) is not None else np.zeros(im.shape[:2], dtype=np.uint8) for im in chunk]
                     else:
-                        mask = runmodel.get_ROI_position(img, net, opt, keepsize=True)
-                if not opt.all_mosaic_area:
-                    mask = impro.find_mostlikely_ROI(mask)
-                imgs.append(img)
-                masks.append(mask)
-                x, y, size, area = impro.boundingSquare(mask, Ex_mul=ex_mul)
-                positions.append([x, y, size])
+                        chunk_masks = [runmodel.get_ROI_position(im, net, opt, keepsize=True) for im in chunk]
+                for img, mask in zip(chunk, chunk_masks):
+                    if not opt.all_mosaic_area:
+                        mask = impro.find_mostlikely_ROI(mask)
+                    imgs.append(img)
+                    masks.append(mask)
+                    x, y, size, area = impro.boundingSquare(mask, Ex_mul=ex_mul)
+                    positions.append([x, y, size])
 
             if not positions:
                 shutil.rmtree(os.path.join(opt.savedir, savecnt), ignore_errors=True)
@@ -398,6 +414,9 @@ def _process_one_video(videopath):
     finally:
         if os.path.isdir(worker_tmp):
             shutil.rmtree(worker_tmp, ignore_errors=True)
+        if opt.gpu_id != '-1' and torch.cuda.is_available():
+            with gpu_lock:
+                torch.cuda.empty_cache()
         dt = time.time() - t0
         with state_lock:
             worker_slots.pop(slot, None)

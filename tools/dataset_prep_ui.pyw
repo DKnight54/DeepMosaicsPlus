@@ -43,6 +43,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.dataset_prep_config.json')
 
 DEFAULTS = {
+    'hwaccel': 'auto',
     'censored_dir': os.path.join(ROOT, 'datasets', 'raw', 'censored'),
     'uncensored_dir': os.path.join(ROOT, 'datasets', 'raw', 'uncensored'),
     'synthetic_source_dir': os.path.join(ROOT, 'datasets', 'raw', 'synthetic_source'),
@@ -51,7 +52,7 @@ DEFAULTS = {
     'model_manifest': os.path.join(ROOT, 'pretrained_models', 'mosaic', 'size_manifest.json'),
     'mosaic_position_model_path': '',
     'roi_model_path': os.path.join(ROOT, 'pretrained_models', 'mosaic', 'add_face.pth'),
-    'fps': 24,
+    'fps': 0,
     'reuse_uncensored': True,
     'real_pairs_workers': 2,
     'real_pairs_no_resume': False,
@@ -540,12 +541,21 @@ class DatasetPrepWindow(QMainWindow):
                             "Size the network trains on and later runs at. Clips are stored a little larger "
                             "(572 px for 512) and randomly cropped.\nChanging it means rebuilding the clips "
                             "(steps 1-3): clips stored smaller would only be enlarged."))
-        self.fps_spin = QSpinBox(); self.fps_spin.setRange(1, 120)
+        self.fps_spin = QSpinBox(); self.fps_spin.setRange(0, 120)
         row.addLayout(field("Frame rate (fps)", self.fps_spin, "Frames per second extracted from your footage in steps 1 and 2."))
         self.gpu_edit = QLineEdit(); self.gpu_edit.setFixedWidth(70)
         row.addLayout(field("GPU id", self.gpu_edit, "Which GPU to train on (0 = first). -1 = CPU, far too slow for real training."))
+        sys.path.insert(0, ROOT)
+        from util.video_sync import detect_hw_decoders
+        hw_info = detect_hw_decoders()
+        self.hwaccel_combo = QComboBox()
+        for label, val in hw_info['choices']:
+            self.hwaccel_combo.addItem(label, val)
+        row.addLayout(field("Video decode", self.hwaccel_combo,
+                            f"Hardware video decoder for FFmpeg extraction & scene indexing.\n{hw_info['summary']}"))
         row.addStretch()
         cl.addLayout(row)
+        cl.addWidget(dim(hw_info['summary']))
         self.size_hint = dim("")
         cl.addWidget(self.size_hint)
         col.addWidget(common)
@@ -860,7 +870,8 @@ class DatasetPrepWindow(QMainWindow):
         for key, edit in self._path_fields.items():
             edit.setText(self.cfg.get(key, ''))
             self._update_path_mark(key)
-        self.fps_spin.setValue(self.cfg.get('fps', 24))
+        self.fps_spin.setValue(self.cfg.get('fps', 0))
+        self.hwaccel_combo.setCurrentIndex(max(0, self.hwaccel_combo.findData(self.cfg.get('hwaccel', 'auto'))))
         self.reuse_check.setChecked(self.cfg.get('reuse_uncensored', True))
         self.workers_spin.setValue(int(self.cfg.get('real_pairs_workers', 2)))
         self.no_resume_check.setChecked(bool(self.cfg.get('real_pairs_no_resume', False)))
@@ -892,6 +903,7 @@ class DatasetPrepWindow(QMainWindow):
         for key, edit in self._path_fields.items():
             self.cfg[key] = edit.text().strip()
         self.cfg['fps'] = self.fps_spin.value()
+        self.cfg['hwaccel'] = self.hwaccel_combo.currentData() or 'auto'
         self.cfg['reuse_uncensored'] = self.reuse_check.isChecked()
         self.cfg['real_pairs_workers'] = self.workers_spin.value()
         self.cfg['real_pairs_no_resume'] = self.no_resume_check.isChecked()
@@ -1361,6 +1373,7 @@ class DatasetPrepWindow(QMainWindow):
                    '--synthetic_source_dir', cfg['synthetic_source_dir'],
                    '--outsize', outsize,
                    '--workers', str(cfg.get('real_pairs_workers', 2)),
+                   '--hwaccel', cfg.get('hwaccel', 'auto'),
                    '--gui_progress']
             if cfg.get('real_pairs_no_resume'):
                 cmd.append('--no_resume')
@@ -1376,6 +1389,7 @@ class DatasetPrepWindow(QMainWindow):
                    '--scene_accept_ratio', str(cfg['scene_accept_ratio']),
                    '--outsize', outsize,
                    '--workers', str(cfg.get('synth_workers', 2)),
+                   '--hwaccel', cfg.get('hwaccel', 'auto'),
                    '--gui_progress']
             if cfg.get('synth_no_resume'):
                 cmd.append('--no_resume')

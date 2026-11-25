@@ -27,7 +27,9 @@ import time
 import shutil
 import argparse
 import threading
+import subprocess, contextlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import torch
 
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -54,7 +56,7 @@ from tools.filter_subtitled_scenes import (
     crop_overlaps_boxes,
     MIN_FRAMES as SUB_MIN_FRAMES,
 )
-from util.video_sync import resolve_pair_cfr, align_pair_folders_dtw, discover_groups, match_group
+from util.video_sync import resolve_pair_cfr, align_pair_folders_dtw, discover_groups, match_group, ffmpeg_hwdecode_args
 
 
 
@@ -121,12 +123,19 @@ def _match_scene_color_to_origin(cropped_pairs, dirty_flags, masks_small):
 
 def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
                         ex_range=(1.2, 1.7), min_frames=100,
-                        gpu_lock=None, show_pbar=True):
+                        gpu_lock=None, show_pbar=True, dtw_path=None):
     """Crop every frame of a pair to the mosaic region and resize to outsize x outsize."""
-    names = sorted(f for f in os.listdir(mosaic_dir) if f.lower().endswith('.jpg'))
-    n_orig = len([f for f in os.listdir(origin_dir) if f.lower().endswith('.jpg')])
-    names = names[:min(len(names), n_orig)]
-    n = len(names)
+    o_all = sorted(f for f in os.listdir(origin_dir) if f.lower().endswith('.jpg'))
+    m_all = sorted(f for f in os.listdir(mosaic_dir) if f.lower().endswith('.jpg'))
+    if dtw_path:
+        orig_paths = [os.path.join(origin_dir, o_all[oi]) for oi, _ in dtw_path]
+        mos_paths = [os.path.join(mosaic_dir, m_all[mj]) for _, mj in dtw_path]
+    else:
+        n_raw = min(len(o_all), len(m_all))
+        orig_paths = [os.path.join(origin_dir, o_all[k]) for k in range(n_raw)]
+        mos_paths = [os.path.join(mosaic_dir, m_all[k]) for k in range(n_raw)]
+    n = len(orig_paths)
+        
     if n < min_frames or n == 0:
          return None, f"too few frames ({n} < {min_frames})"
 
@@ -134,17 +143,17 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
     pos = np.zeros((n, 3), dtype=np.int64)
 
     use_yolo_batch = isinstance(netM, YoloMosaicDetector) and hasattr(netM, 'detect_batch')
-    batch_size = 16
+    batch_size = 8
 
     pbar_loc = tqdm(total=n, desc='  locating mosaic', leave=False, disable=not show_pbar)
     raw_masks = [None] * n
     for start_i in range(0, n, batch_size):
-        chunk_names = names[start_i:start_i + batch_size]
+        chunk_paths = mos_paths[start_i:start_i + batch_size]
         chunk_imgs = []
         valid_indices = []
 
-        for offset, name in enumerate(chunk_names):
-            frame = impro.imread(os.path.join(mosaic_dir, name))
+        for offset, mpath in enumerate(chunk_paths):
+            frame = impro.imread(mpath)
             if frame is not None:
                 chunk_imgs.append(frame)
                 valid_indices.append(start_i + offset)
@@ -167,8 +176,13 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
                     pos[idx] = (x, y, size)
                     raw_masks[idx] = mask
 
-        pbar_loc.update(len(chunk_names))
+
+        pbar_loc.update(len(chunk_paths))
     pbar_loc.close()
+    if gpu_lock is not None:
+        with gpu_lock:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     valid = pos[:, 2] > 0
     if not valid.any():
@@ -187,8 +201,7 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
         pos[:, c] = _edge_median(pos[:, c], win)
 
     ex_mul = random.uniform(*ex_range)
-    orig_paths = [os.path.join(origin_dir, name) for name in names]
-    mos_paths = [os.path.join(mosaic_dir, name) for name in names]
+
     overlay_boxes = find_fullframe_overlay_boxes(orig_paths, mos_paths)
 
     dirty_flags = []
@@ -196,7 +209,7 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
     masks_small = []
     sides, size_mismatch = [], False
 
-    for i, name in enumerate(tqdm(names, desc='  Cropping Mosaic area', leave=False, disable=not show_pbar)):
+    for i in tqdm(range(n), desc='  Cropping Mosaic area', leave=False, disable=not show_pbar):
         mosaic = impro.imread(mos_paths[i])
         origin = impro.imread(orig_paths[i])
         if mosaic is None or origin is None:
@@ -218,14 +231,24 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
             masks_small.append(None)
             continue
 
-        dirty_flags.append(False)
+        
         box = (slice(cy - half, cy + half), slice(cx - half, cx + half))
+        mask_crop = raw_masks[i][box] if i < len(raw_masks) and raw_masks[i] is not None else np.zeros((2 * half, 2 * half), dtype=np.uint8)
+        roi_diff = np.abs(origin[box].astype(np.int16) - mosaic[box].astype(np.int16)).mean(axis=2)
+        active = mask_crop > 0
+        box_diff = float(roi_diff[active].mean()) if int(active.sum()) >= 32 else float(roi_diff.mean())
+        if box_diff < 10.0:
+            dirty_flags.append(True)
+            cropped_pairs.append(None)
+            masks_small.append(None)
+            continue
+
+        dirty_flags.append(False)
         interp = cv2.INTER_AREA if 2 * half > outsize else cv2.INTER_CUBIC
         cropped_pairs.append((
             cv2.resize(origin[box], (outsize, outsize), interpolation=interp),
             cv2.resize(mosaic[box], (outsize, outsize), interpolation=interp),
         ))
-        mask_crop = raw_masks[i][box] if i < len(raw_masks) and raw_masks[i] is not None else np.zeros((2 * half, 2 * half), dtype=np.uint8)
         masks_small.append(cv2.resize(mask_crop, (outsize, outsize), interpolation=cv2.INTER_NEAREST))
         sides.append(2 * half)
 
@@ -357,138 +380,63 @@ def extract_frames(videopath, out_dir, fps, start_sec=None, duration_sec=None):
         ffmpeg_util.video2image(videopath, out_pattern, fps=fps)
 
 
-def detect_pct(opt, netM, censored_video, n_samples, min_pct, max_pct,
-               scan_stride_sec=2.0, max_gap_sec=5.0, min_scene_sec=3.0,
-               gpu_lock=None, show_pbar=True, progress_cb=None):
-    """Single-pass sequential scan using cap.grab().
-    Discovers continuous censored scenes and estimates mosaic block % per scene.
-    Returns a list of scene dicts:
-      [{'start': float, 'duration': float, 'pct': float,
-        'confidence': float, 'n_nonsquare': int, 'n_samples': int}, ...]
-    """
-    cap = cv2.VideoCapture(censored_video)
-    if not cap.isOpened():
-        return []
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames <= 0:
-        cap.release()
-        return []
-
-    step = max(1, int(round(fps * scan_stride_sec)))
-    min_size = getattr(opt, 'min_mosaic_size', 100)
-    min_conf = getattr(opt, 'auto_model_min_confidence', 0.15)
-    max_samples_per_scene = max(n_samples, 12)
-    use_yolo = isinstance(netM, YoloMosaicDetector)
-
-    hits = []  # list of (timestamp_sec, frame, mask)
-    frame_idx = 0
-
-    pbar = tqdm(total=total_frames, desc='  scanning video', unit='frame', leave=False, disable=not show_pbar)
-    while True:
-        if not cap.grab():
-            break
-
-        if frame_idx % step == 0:
-            ok, frame = cap.retrieve()
-            if ok and frame is not None:
-                orig_h, orig_w = frame.shape[:2]
-                max_side = max(orig_h, orig_w)
-
-                if use_yolo and max_side > 640:
-                    scale = 640.0 / max_side
-                    scan_frame = cv2.resize(
-                        frame,
-                        (int(round(orig_w * scale)), int(round(orig_h * scale))),
-                        interpolation=cv2.INTER_AREA,
-                    )
-                    if gpu_lock is not None:
-                        with gpu_lock:
-                            mask_small, x, y, size = netM.detect(scan_frame, opt)
-                    else:
-                        mask_small, x, y, size = netM.detect(scan_frame, opt)
-                    size = int(round(size / scale))
-                    if mask_small is not None and size > min_size:
-                        mask = cv2.resize(mask_small, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-                    else:
-                        mask = None
-                elif use_yolo:
-                    if gpu_lock is not None:
-                        with gpu_lock:
-                            mask, x, y, size = netM.detect(frame, opt)
-                    else:
-                        mask, x, y, size = netM.detect(frame, opt)
-                else:
-                    if gpu_lock is not None:
-                        with gpu_lock:
-                            mask, x, y, size = runmodel.get_mosaic_position(frame, netM, opt)
-                    else:
-                        mask, x, y, size = runmodel.get_mosaic_position(frame, netM, opt)
-
-                if mask is not None and size > min_size:
-                    hits.append((frame_idx / fps, frame, mask))
-                    if show_pbar:
-                        pbar.set_postfix(hits=len(hits), refresh=False)
-
-        frame_idx += 1
-        pbar.update(1)
-        if progress_cb is not None and (frame_idx % (step * 5) == 0):
-            progress_cb(int(100 * frame_idx / max(1, total_frames)))
-
-    pbar.close()
+def detect_pct(opt, netM, videopath, n_samples=8, min_pct=2.0, max_pct=10.0, gpu_lock=None, show_pbar=False, hwaccel="auto"):
+    """Fast hardware-decoded scene & mosaic-size scanner (0.5 fps @ 640px wide)."""
+    cap = cv2.VideoCapture(videopath)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
     cap.release()
-
-    if not hits:
+    if w <= 0 or h <= 0:
         return []
 
-    # Group adjacent hits into continuous scenes
-    raw_scenes = []
-    cur = [hits[0]]
-    for item in hits[1:]:
-        if item[0] - cur[-1][0] <= max_gap_sec:
-            cur.append(item)
-        else:
-            raw_scenes.append(cur)
-            cur = [item]
-    raw_scenes.append(cur)
+    sw = min(640, w)
+    sh = max(32, int(round(h * (sw / float(w)))) // 2 * 2)
+    step_sec = 2.0
 
-    # Estimate mosaic block % individually for each scene
-    scenes = []
-    video_dur = total_frames / fps
-    for group in raw_scenes:
-        start_sec = max(0.0, group[0][0] - (scan_stride_sec * 0.5))
-        end_sec = min(video_dur, group[-1][0] + (scan_stride_sec * 0.5))
-        duration_sec = end_sec - start_sec
+    def _grab_samples(use_hw=True):
+        hw_flags = ffmpeg_hwdecode_args(hwaccel) if use_hw else []
+        cmd = ["ffmpeg", "-v", "error", *hw_flags, "-i", videopath,
+               "-vf", f"fps={1.0 / step_sec},scale={sw}:{sh}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                creationflags=0x08000000 if os.name == "nt" else 0)
+        fbytes = sw * sh * 3
+        out_frames = []
+        while True:
+            raw = proc.stdout.read(fbytes)
+            if len(raw) < fbytes:
+                break
+            out_frames.append(np.frombuffer(raw, dtype=np.uint8).reshape((sh, sw, 3)).copy())
+        proc.stdout.close()
+        proc.wait()
+        return out_frames
 
-        if duration_sec < min_scene_sec:
-            continue
+    frames = _grab_samples(use_hw=True)
+    if not frames and (hwaccel or "auto").lower() != "cpu":
+        frames = _grab_samples(use_hw=False)
+    if not frames:
+        return []
 
-        if len(group) > max_samples_per_scene:
-            idxs = np.linspace(0, len(group) - 1, max_samples_per_scene, dtype=int)
-            sampled = [group[i] for i in idxs]
-        else:
-            sampled = group
-
-        pairs = [(f, m) for (_ts, f, m) in sampled]
-        res = mosaic_util.estimate_mosaic_block_pct_multi(
-            pairs,
-            min_confidence=min_conf,
-            min_pct=1.2,
-            max_pct=max(max_pct, 12.0),
-        )
-        if res is None:
-            continue
-
-        scenes.append({
-            'start': start_sec,
-            'duration': duration_sec,
-            'pct': res['pct'],
-            'confidence': res['confidence'],
-            'n_nonsquare': res.get('n_nonsquare', 0),
-            'n_samples': len(pairs),
-        })
-
+    scenes, cur = [], None
+    for idx, bgr in enumerate(frames):
+        t_sec = idx * step_sec
+        with (gpu_lock or contextlib.nullcontext()):
+            mask, _, _, size = runmodel.get_mosaic_position(bgr, netM, opt)
+        if mask is not None and size > 4:
+            est = mosaic_util.estimate_mosaic_block_pct_multi(
+                [(bgr, mask)], min_confidence=0.10, min_pct=min_pct, max_pct=max_pct
+            )
+            pct = float(est['pct']) if est else 0.5 * (min_pct + max_pct)
+            if cur is None:
+                cur = {"start": t_sec, "end": t_sec + step_sec, "pcts": [pct]}
+            else:
+                cur["end"] = t_sec + step_sec
+                cur["pcts"].append(pct)
+        elif cur is not None:
+            if cur["end"] - cur["start"] >= 4.5:
+                scenes.append({"start": cur["start"], "duration": cur["end"] - cur["start"], "pct": float(np.median(cur["pcts"]))})
+            cur = None
+    if cur is not None and cur["end"] - cur["start"] >= 4.5:
+        scenes.append({"start": cur["start"], "duration": cur["end"] - cur["start"], "pct": float(np.median(cur["pcts"]))})
     return scenes
 
 
@@ -514,29 +462,10 @@ def maybe_reuse_uncensored(pairs, mode, synthetic_source_dir):
 def _cleanup_partial_pair(output_dir, pair_name):
     """Remove any leftover scene folders for a pair that did not finish cleanly."""
     for sub in ('bucket_*', '_staging'):
-        for d in glob.glob(os.path.join(output_dir, sub, f"{pair_name}_scene*")):
+        for d in glob.glob(os.path.join(output_dir, sub, f"{pair_name}_s*")):
             if os.path.isdir(d):
                 shutil.rmtree(d, ignore_errors=True)
 
-
-def _find_existing_pair_scenes(output_dir, pair_name):
-    """Find already-extracted scene folders on disk for pairs built before .done markers existed."""
-    found = []
-    pattern = os.path.join(output_dir, 'bucket_*', f"{pair_name}_scene*")
-    for d in sorted(glob.glob(pattern)):
-        orig_d = os.path.join(d, 'origin_image')
-        mos_d = os.path.join(d, 'mosaic_image')
-        if os.path.isdir(orig_d) and os.path.isdir(mos_d):
-            n_o = len([f for f in os.listdir(orig_d) if f.lower().endswith('.jpg')])
-            n_m = len([f for f in os.listdir(mos_d) if f.lower().endswith('.jpg')])
-            if n_o >= 100 and n_o == n_m:
-                bucket_folder = os.path.basename(os.path.dirname(d))
-                try:
-                    b_val = float(bucket_folder.replace('bucket_', ''))
-                except ValueError:
-                    b_val = 0.0
-                found.append((os.path.basename(d), 0.0, b_val))
-    return found
 
 
 def main():
@@ -550,11 +479,12 @@ def main():
     parser.add_argument('--outsize', type=int, default=572)
     parser.add_argument('--no_crop', action='store_true')
     parser.add_argument('--reuse_uncensored_for_synthetic', choices=['ask', 'yes', 'no'], default='ask')
-    parser.add_argument('--yolo_conf', type=float, default=0.35)
+    parser.add_argument('--yolo_conf', type=float, default=0.48)
     parser.add_argument('--synthetic_source_dir', default=os.path.join('datasets', 'raw', 'synthetic_source'))
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--no_resume', action='store_true')
     parser.add_argument('--gui_progress', action='store_true')
+    parser.add_argument('--hwaccel', default='auto', help='FFmpeg hardware decoder (auto, d3d11va, d3d11va:1, cuda, cpu)')
     known, remaining = parser.parse_known_args()
 
     sys.argv = [sys.argv[0]] + remaining
@@ -643,11 +573,11 @@ def main():
         logs, g_res = [], []
         try:
             qc_dir = os.path.join(known.output_dir, '_sync_qc')
-            scenes = match_group(label, cen_paths, unc_paths, qc_dir, export_dir=None)
+            scenes = match_group(label, cen_paths, unc_paths, qc_dir, export_dir=None, hwaccel=known.hwaccel)
             if not scenes:
                 logs.append(f"  {label}: 0 matched scenes.")
             mos_by_file = {
-                os.path.basename(cp): detect_pct(opt, netM, cp, known.n_samples, min_pct, max_pct, gpu_lock=gpu_lock, show_pbar=False)
+                os.path.basename(cp): detect_pct(opt, netM, cp, known.n_samples, min_pct, max_pct, gpu_lock=gpu_lock, show_pbar=False, hwaccel=known.hwaccel)
                 for cp in cen_paths
             }
             sub_scenes = []
@@ -662,7 +592,7 @@ def main():
                         continue
                     cur_t = ov0
                     while cur_t < ov1 - 4.0:
-                        seg_dur = min(45.0, ov1 - cur_t)
+                        seg_dur = min(18.0, ov1 - cur_t)
                         sub_scenes.append({
                             'clip_name': f"{os.path.splitext(sc['clip_name'])[0]}_m{len(sub_scenes):03d}.mp4",
                             'cen_source': sc['cen_source'],
@@ -689,7 +619,9 @@ def main():
                 extract_frames(unc_src, origin_dir, scene_fps, start_sec=sc['unc_start'], duration_sec=sc['duration'])
                 extract_frames(cen_src, mosaic_dir, scene_fps, start_sec=sc['cen_start'], duration_sec=sc['duration'])
 
-                ok_sync, _, sync_info = align_pair_folders_dtw(origin_dir, mosaic_dir, max_band=3, min_mean_corr=0.80)
+                ok_sync, _, sync_info, dtw_path = align_pair_folders_dtw(
+                    origin_dir, mosaic_dir, max_band=3, min_mean_corr=0.80, relink_files=False
+                )
                 if not ok_sync:
                     shutil.rmtree(stage_dir, ignore_errors=True)
                     logs.append(f"    {clip_tag}: skipped ({sync_info})")
@@ -698,6 +630,7 @@ def main():
                 stats, skip_reason = crop_pair_to_mosaic(
                     netM, opt, origin_dir, mosaic_dir, known.outsize,
                     min_frames=known.min_frames, gpu_lock=gpu_lock, show_pbar=show_inner_pbar,
+                    dtw_path=dtw_path,
                 )
                 if stats is None:
                     shutil.rmtree(stage_dir, ignore_errors=True)
