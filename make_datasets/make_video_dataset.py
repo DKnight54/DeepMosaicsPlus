@@ -37,6 +37,8 @@ from tools.filter_subtitled_scenes import (
     MIN_FRAMES as SUB_MIN_FRAMES,
 )
 from PIL import Image, PngImagePlugin
+from util import filt, util, mosaic, data, ffmpeg
+from util.video_sync import probe_cfr_fps
 
 
 opt.parser.add_argument('--datadir', type=str, default='your video dir', help='')
@@ -57,6 +59,7 @@ opt.parser.add_argument('--no_resume', action='store_true',
                         help='reprocess all source videos from scratch instead of skipping .done videos')
 opt.parser.add_argument('--gui_progress', action='store_true',
                         help='emit machine-readable @@PROGRESS lines and suppress tqdm bars')
+opt.parser.add_argument('--fps', type=int, default=0, help='target FPS (0 = auto native CFR, >0 = manual override)')
 
 opt = opt.getparse()
 
@@ -176,6 +179,7 @@ def _process_one_video(videopath):
     t0 = time.time()
     worker_tmp = os.path.join(opt.temp_dir, f"worker_{threading.get_ident()}")
     local_sides = []
+    scene_fps = float(opt.fps) if int(getattr(opt, 'fps', 0)) > 0 else probe_cfr_fps(videopath)
     clips_created = 0
 
     with state_lock:
@@ -250,7 +254,7 @@ def _process_one_video(videopath):
             ffmpeg.video2image(
                 videopath,
                 os.path.join(worker_tmp, '%05d.' + opt.tempimage_type),
-                fps=opt.fps,
+                scene_fps,
                 start_time=timestamp,
                 last_time=util.second2stamp(opt.time),
             )
@@ -343,7 +347,7 @@ def _process_one_video(videopath):
                     float(min(h_img, w_img)),
                 ))
 
-            min_keep = min(SUB_MIN_FRAMES, max(1, int(opt.time * opt.fps * 0.8)))
+            min_keep = min(SUB_MIN_FRAMES, max(1, int(opt.time * scene_fps * 0.8)))
             valid_imgs = [p[0] for p in cropped_pairs if p is not None]
             if len(valid_imgs) < min_keep:
                 shutil.rmtree(os.path.join(opt.savedir, savecnt), ignore_errors=True)

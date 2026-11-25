@@ -290,14 +290,65 @@ def real_pairs_summary(folder):
 def manifest_summary(path):
     """(buckets, how many have their checkpoint file) or None if unreadable."""
     try:
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             manifest = json.load(f)
     except Exception:
         return None
     base = os.path.dirname(os.path.abspath(path))
-    have = sum(os.path.exists(p if os.path.isabs(p) else os.path.join(base, p)) for p in manifest.values())
+    have = 0
+    for val in manifest.values():
+        rel = val.get('model', '') if isinstance(val, dict) else str(val)
+        if rel and os.path.exists(rel if os.path.isabs(rel) else os.path.join(base, rel)):
+            have += 1
     return len(manifest), have
 
+def recommend_bucket_ranges(bucket_centers, real_pairs_dir=''):
+    """Compute (min_pct, max_pct) bounds for sorted bucket_centers using Voronoi midpoints
+    for interior boundaries and real_pair post-crop p05/p95 for outer floor/ceiling
+    (falling back cleanly to Voronoi defaults if no real_pair data exists)."""
+    import numpy as np
+    centers = sorted(float(b) for b in bucket_centers)
+    if not centers:
+        return {}, []
+
+    pcts = []
+    if real_pairs_dir and os.path.isdir(real_pairs_dir):
+        try:
+            sys.path.insert(0, os.path.join(ROOT, 'tools'))
+            import measure_postcrop_pct as mpp
+            for b_dir in os.listdir(real_pairs_dir):
+                full_b = os.path.join(real_pairs_dir, b_dir)
+                if os.path.isdir(full_b) and b_dir.startswith('bucket_'):
+                    for clip in os.listdir(full_b):
+                        c_path = os.path.join(full_b, clip)
+                        if os.path.isdir(os.path.join(c_path, 'origin_image')):
+                            res = mpp.measure_clip_pct(c_path)
+                            if res is not None:
+                                pcts.append(float(res))
+        except Exception:
+            pcts = []
+
+    if len(pcts) >= 10:
+        arr = np.array(pcts, dtype=float)
+        floor = float(max(2.0, min(centers[0] - 0.3, round(float(np.percentile(arr, 5)), 2))))
+        ceil = float(min(10.5, max(centers[-1] + 0.5, round(float(np.percentile(arr, 95)), 2))))
+        note = f"Calibrated from {len(pcts)} real-pair clips (p05={floor:.2f}%, p95={ceil:.2f}%)"
+    else:
+        floor = round(max(2.0, centers[0] - 1.8), 2)
+        ceil = round(max(9.5, centers[-1] + 2.5), 2)
+        arr = None
+        note = "Voronoi default fallback (no real-pair audit clips found)"
+
+    ranges, warnings = {}, [note]
+    for i, b in enumerate(centers):
+        lo = floor if i == 0 else round(0.5 * (centers[i - 1] + b), 2)
+        hi = ceil if i == len(centers) - 1 else round(0.5 * (b + centers[i + 1]), 2)
+        ranges[b] = (lo, hi)
+        if arr is not None:
+            cnt = int(((arr >= lo) & (arr <= hi)).sum())
+            if cnt < 15:
+                warnings.append(f"Bucket {b:g}% [{lo:.2f}%-{hi:.2f}%] has {cnt} real-pair clips (< 15 recommended).")
+    return ranges, warnings
 
 def plural(n, word):
     return f"{n} {word}{'' if n == 1 else 's'}"
@@ -711,22 +762,33 @@ class DatasetPrepWindow(QMainWindow):
     def _build_manifest_tab(self):
         w = QWidget()
         layout = QVBoxLayout(w); layout.setContentsMargins(18, 14, 18, 14); layout.setSpacing(10)
-        layout.addWidget(dim("Each bucket is a mosaic block size (% of the frame's shorter side) with the model file that handles it. "
-                             "Training makes one model per bucket; copy the checkpoint you like to the path shown here (with its .json)."))
+        layout.addWidget(dim("Each bucket defines a target mosaic block % center, its [Floor %, Ceiling %] routing & training range, "
+                             "and the checkpoint file that serves it. Switch manifests here to manage separate model packs."))
+
+        man_row = QHBoxLayout()
+        man_row.addWidget(QLabel("Active manifest:"))
+        self.manifest_tab_edit = QLineEdit()
+        self.manifest_tab_edit.editingFinished.connect(self._sync_manifest_path_from_tab)
+        man_row.addWidget(self.manifest_tab_edit, stretch=1)
+        b_open = QPushButton("Browse…"); b_open.clicked.connect(self._browse_manifest_tab); man_row.addWidget(b_open)
+        b_saveas = QPushButton("Save As…"); b_saveas.clicked.connect(self._save_manifest_as); man_row.addWidget(b_saveas)
+        layout.addLayout(man_row)
+
         btn_row = QHBoxLayout()
         for text, slot in (("Reload", self._load_manifest), ("Add bucket", self._add_bucket_row),
-                           ("Delete selected", self._delete_bucket_row), ("Save manifest", self._save_manifest)):
+                           ("Delete selected", self._delete_bucket_row), ("Recommend ranges", self._recommend_ranges),
+                           ("Save manifest", self._save_manifest)):
             b = QPushButton(text); b.clicked.connect(slot); btn_row.addWidget(b)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
-        self.manifest_table = QTableWidget(0, 4)
-        self.manifest_table.setHorizontalHeaderLabels(["Bucket %", "Model file", "Model", "Real-pair clips"])
-        self.manifest_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.manifest_table = QTableWidget(0, 6)
+        self.manifest_table.setHorizontalHeaderLabels(
+            ["Bucket %", "Floor %", "Ceiling %", "Model file", "Model", "Real-pair clips"])
+        self.manifest_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.manifest_table.verticalHeader().setVisible(False)
         layout.addWidget(self.manifest_table, stretch=1)
         return w
-
     # ------------------------------------------------------------ config --
     def _update_hints(self, *_):
         size = self.model_size_combo.currentData() or 512
@@ -1149,29 +1211,76 @@ class DatasetPrepWindow(QMainWindow):
         self._refresh_status()
 
     # ---------------------------------------------------------- manifest --
+    def _sync_manifest_path_from_tab(self):
+        p = self.manifest_tab_edit.text().strip()
+        if p and hasattr(self, '_path_fields') and self._path_fields['model_manifest'].text().strip() != p:
+            self._path_fields['model_manifest'].setText(p)
+            self._load_manifest()
+            self._refresh_status()
+
+    def _browse_manifest_tab(self):
+        cur = self.manifest_tab_edit.text().strip() or os.path.join(ROOT, 'pretrained_models', 'mosaic')
+        p, _ = QFileDialog.getOpenFileName(self, "Select size manifest", cur, "JSON (*.json)")
+        if p:
+            self.manifest_tab_edit.setText(p)
+            self._sync_manifest_path_from_tab()
+
+    def _save_manifest_as(self):
+        cur = self.manifest_tab_edit.text().strip() or os.path.join(ROOT, 'pretrained_models', 'mosaic', 'size_manifest_custom.json')
+        p, _ = QFileDialog.getSaveFileName(self, "Save size manifest as", cur, "JSON (*.json)")
+        if p:
+            self.manifest_tab_edit.setText(p)
+            self._path_fields['model_manifest'].setText(p)
+            self._save_manifest()
+
+    def _recommend_ranges(self):
+        centers = []
+        for row in range(self.manifest_table.rowCount()):
+            it = self.manifest_table.item(row, 0)
+            if it and it.text().strip():
+                try:
+                    centers.append((row, float(it.text().strip())))
+                except ValueError:
+                    pass
+        if not centers:
+            return
+        rp_dir = self._path_fields['real_pairs_dir'].text().strip() if hasattr(self, '_path_fields') else ''
+        ranges, warnings = recommend_bucket_ranges([b for _, b in centers], rp_dir)
+        for row, b in centers:
+            lo, hi = ranges[b]
+            self.manifest_table.setItem(row, 1, QTableWidgetItem(f"{lo:.2f}"))
+            self.manifest_table.setItem(row, 2, QTableWidgetItem(f"{hi:.2f}"))
+        QMessageBox.information(self, "Bucket Range Recommendation", "\n".join(warnings))
+
     def _load_manifest(self):
         self.manifest_table.setRowCount(0)
-        path = self._path_fields['model_manifest'].text() if hasattr(self, '_path_fields') else self.cfg['model_manifest']
+        path = self._path_fields['model_manifest'].text().strip() if hasattr(self, '_path_fields') else self.cfg['model_manifest']
+        if hasattr(self, 'manifest_tab_edit') and self.manifest_tab_edit.text().strip() != path:
+            self.manifest_tab_edit.setText(path)
         if not path or not os.path.exists(path):
             return
         try:
-            with open(path) as f:
-                manifest = json.load(f)
+            sys.path.insert(0, ROOT)
+            from models.loadmodel import load_size_manifest_details
+            details = load_size_manifest_details(path)
         except Exception as e:
             self._log(f"Could not read manifest: {e}")
             return
         base_dir = os.path.dirname(os.path.abspath(path))
         real = real_pairs_summary(self._path_fields['real_pairs_dir'].text())
-        for bucket, rel_path in sorted(manifest.items(), key=lambda kv: float(kv[0])):
+        for b, info in sorted(details.items()):
             row = self.manifest_table.rowCount()
             self.manifest_table.insertRow(row)
-            self.manifest_table.setItem(row, 0, QTableWidgetItem(str(bucket)))
-            self.manifest_table.setItem(row, 1, QTableWidgetItem(str(rel_path)))
+            label = f"{b:g}"
+            self.manifest_table.setItem(row, 0, QTableWidgetItem(label))
+            self.manifest_table.setItem(row, 1, QTableWidgetItem(f"{info['min_pct']:g}"))
+            self.manifest_table.setItem(row, 2, QTableWidgetItem(f"{info['max_pct']:g}"))
+            rel_path = info['model']
+            self.manifest_table.setItem(row, 3, QTableWidgetItem(rel_path))
             abs_path = rel_path if os.path.isabs(rel_path) else os.path.join(base_dir, rel_path)
             found = os.path.exists(abs_path)
             text = "not trained yet"
             if found:
-                text = "ready"
                 try:
                     with open(os.path.splitext(abs_path)[0] + '.json') as f:
                         text = f"ready ({int(json.load(f)['finesize'])} px)"
@@ -1180,19 +1289,20 @@ class DatasetPrepWindow(QMainWindow):
             exists_item = QTableWidgetItem(text)
             exists_item.setForeground(QColor(C['green'] if found else C['amber']))
             exists_item.setFlags(exists_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.manifest_table.setItem(row, 2, exists_item)
-            label = f"{float(bucket):g}"
-            n_item = QTableWidgetItem(str(real.get(label, real.get(str(bucket), 0))))
+            self.manifest_table.setItem(row, 4, exists_item)
+            n_item = QTableWidgetItem(str(real.get(label, 0)))
             n_item.setFlags(n_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.manifest_table.setItem(row, 3, n_item)
+            self.manifest_table.setItem(row, 5, n_item)
 
     def _add_bucket_row(self):
         row = self.manifest_table.rowCount()
         self.manifest_table.insertRow(row)
-        self.manifest_table.setItem(row, 0, QTableWidgetItem("0"))
-        self.manifest_table.setItem(row, 1, QTableWidgetItem("clean_Xpct.pth"))
-        self.manifest_table.setItem(row, 2, QTableWidgetItem(""))
-        self.manifest_table.setItem(row, 3, QTableWidgetItem(""))
+        self.manifest_table.setItem(row, 0, QTableWidgetItem("7"))
+        self.manifest_table.setItem(row, 1, QTableWidgetItem("6.50"))
+        self.manifest_table.setItem(row, 2, QTableWidgetItem("9.50"))
+        self.manifest_table.setItem(row, 3, QTableWidgetItem("clean_youknow_video_7pct.pth"))
+        self.manifest_table.setItem(row, 4, QTableWidgetItem(""))
+        self.manifest_table.setItem(row, 5, QTableWidgetItem(""))
 
     def _delete_bucket_row(self):
         rows = sorted({idx.row() for idx in self.manifest_table.selectedIndexes()}, reverse=True)
@@ -1200,18 +1310,28 @@ class DatasetPrepWindow(QMainWindow):
             self.manifest_table.removeRow(r)
 
     def _save_manifest(self):
-        path = self._path_fields['model_manifest'].text()
+        path = self._path_fields['model_manifest'].text().strip()
         if not path:
             QMessageBox.warning(self, "No path", "Set the size manifest path on the Folders & models tab first.")
             return
         manifest = {}
         for row in range(self.manifest_table.rowCount()):
-            bucket_item = self.manifest_table.item(row, 0)
-            path_item = self.manifest_table.item(row, 1)
-            if bucket_item and path_item and bucket_item.text().strip():
-                manifest[bucket_item.text().strip()] = path_item.text().strip()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'w') as f:
+            b_it = self.manifest_table.item(row, 0)
+            lo_it = self.manifest_table.item(row, 1)
+            hi_it = self.manifest_table.item(row, 2)
+            m_it = self.manifest_table.item(row, 3)
+            if b_it and m_it and b_it.text().strip():
+                b_key = b_it.text().strip()
+                b_val = float(b_key)
+                lo_val = float(lo_it.text().strip()) if (lo_it and lo_it.text().strip()) else round(max(2.0, b_val - 0.5), 2)
+                hi_val = float(hi_it.text().strip()) if (hi_it and hi_it.text().strip()) else round(b_val + 0.5, 2)
+                manifest[b_key] = {
+                    "model": m_it.text().strip(),
+                    "min_pct": round(lo_val, 2),
+                    "max_pct": round(hi_val, 2),
+                }
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
             json.dump(manifest, f, indent=2)
         self._log(f"Manifest saved to {path}")
         self._load_manifest()

@@ -1048,6 +1048,14 @@ class MainWindow(QMainWindow):
             "Falls back to the Model path above if confidence is low.")
         self.auto_model_cb.toggled.connect(lambda checked: self.model_in.setEnabled(not checked))
         sb.addWidget(self.auto_model_cb)
+        self.manifest_in = _inp("Size manifest .json…", "./pretrained_models/mosaic/size_manifest.json")
+        self.manifest_btn = _browse()
+        self.manifest_btn.clicked.connect(lambda: self._pick_file(self.manifest_in, "Select size manifest", "JSON (*.json)"))
+        self.manifest_in.setEnabled(False)
+        self.manifest_btn.setEnabled(False)
+        self.auto_model_cb.toggled.connect(self.manifest_in.setEnabled)
+        self.auto_model_cb.toggled.connect(self.manifest_btn.setEnabled)
+        sb.addLayout(_row(_rl("Manifest"), self.manifest_in, self.manifest_btn))
         self.infer_size_sel = QComboBox()
         self.infer_size_sel.addItems(["Auto", "256", "384", "512"])
         self.infer_size_sel.setToolTip(
@@ -1310,6 +1318,9 @@ class MainWindow(QMainWindow):
         if mdl:                             cmd.extend(["--model_path", mdl])
         if self.auto_model_cb.isChecked():
             cmd.append("--auto_model")
+            man = self.manifest_in.text().strip()
+            if man:
+                cmd.extend(["--model_manifest", man])
         media_text = self.media_in.text().strip().strip('"')
         if self._is_image(media_text):
             fmt = self.img_fmt_sel.currentData()

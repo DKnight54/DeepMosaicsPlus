@@ -19,11 +19,19 @@ def deploy_all(manifest_path=None, checkpoints_root=None):
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
+    man_base = os.path.splitext(os.path.basename(manifest_path))[0]
+    ckpt_prefix = "" if man_base == "size_manifest" else man_base
+
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     deployed = 0
 
-    for pct_key, rel_target in sorted(manifest.items(), key=lambda kv: float(next(iter(kv)))):
-        ckpt_dir = os.path.join(checkpoints_root, f"clean_{pct_key}pct")
+    for pct_key, entry in sorted(manifest.items(), key=lambda kv: float(next(iter(kv)))):
+        rel_target = entry.get("model", "") if isinstance(entry, dict) else str(entry)
+        if not rel_target:
+            print(f"[skip] Bucket {pct_key}%: no 'model' path in manifest entry")
+            continue
+        sub_name = os.path.join(ckpt_prefix, f"clean_{pct_key}pct") if ckpt_prefix else f"clean_{pct_key}pct"
+        ckpt_dir = os.path.join(checkpoints_root, sub_name)
         if not os.path.isdir(ckpt_dir):
             print(f"[skip] Bucket {pct_key}%: checkpoint folder not found ({ckpt_dir})")
             continue

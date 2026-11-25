@@ -82,12 +82,24 @@ opt.parser.add_argument('--dataset_mosaic_pct', type=float, default=None,
          '+ mask/) — folders with real paired data (origin_image/ + mosaic_image/) are unaffected, '
          'since those already use one fixed real size. Leave unset for the original one-size-fits-all '
          'training behavior.')
+opt.parser.add_argument('--dataset_mosaic_pct_min', type=float, default=0.0, help='Bucket floor %% for synthetic mosaic sampling')
+opt.parser.add_argument('--dataset_mosaic_pct_max', type=float, default=0.0, help='Bucket ceiling %% for synthetic mosaic sampling')
+opt.parser.add_argument('--lambda_temp', type=float, default=15.0, help='Temporal-difference L1 loss weight between frame t and t-1')
+opt.parser.add_argument('--adaptive_loss', action='store_true', default=True, help='Enable closed-loop validation thermostat nudging lambdas & lr')
+opt.parser.add_argument('--no_adaptive_loss', action='store_false', dest='adaptive_loss', help='Disable closed-loop validation thermostat')
 opt.parser.add_argument('--n_epoch',type=int,default=200, help='')
 opt.parser.add_argument('--save_freq',type=int,default=10000, help='')
 opt.parser.add_argument('--continue_train', action='store_true', help='resume from the newest checkpoint in checkpoints/<savename>: loads the generator (and discriminator), the optimizer state if it was saved, and continues counting from that iteration (TensorBoard curves continue too). Starts from scratch, with a message, if there is no checkpoint or it was trained at another --finesize')
 opt.parser.add_argument('--savename',type=str,default='face', help='')
 opt.parser.add_argument('--showresult_freq',type=int,default=1000, help='')
 opt.parser.add_argument('--showresult_num',type=int,default=4, help='')
+
+def _grad_mag_batch(tensor_bchw):
+    """Sobel edge gradient magnitude on BCHW [-1, 1] tensor."""
+    gray = 0.299 * tensor_bchw[:, 0:1] + 0.587 * tensor_bchw[:, 1:2] + 0.114 * tensor_bchw[:, 2:3]
+    gx = gray[:, :, :, 2:] - gray[:, :, :, :-2]
+    gy = gray[:, :, 2:, :] - gray[:, :, :-2, :]
+    return torch.sqrt(gx[:, :, 1:-1, :] ** 2 + gy[:, :, :, 1:-1] ** 2 + 1e-6)
 
 def ImageQualityEvaluation(tensor1,tensor2,showiter,writer,tag):
     batch_len = len(tensor1)
@@ -186,7 +198,7 @@ if __name__ == '__main__':
 
     def save_resume_state(iteration):
         # Optimizer state + iteration, so --continue_train resumes exactly (one file, overwritten each save).
-        state = {'iteration': iteration, 'finesize': opt.finesize, 'optimizer_G': optimizer_G.state_dict()}
+        state = {'iteration': iteration, 'finesize': opt.finesize, 'optimizer_G': optimizer_G.state_dict(),'adaptive_hp': {'lr': opt.lr, 'lambda_L2': opt.lambda_L2, 'lambda_VGG': opt.lambda_VGG, 'lambda_temp': opt.lambda_temp, 'lambda_GAN': opt.lambda_GAN}, 'ctrl_state': ctrl_state}
         if not opt.no_gan:
             state['optimizer_D'] = optimizer_D.state_dict()
         path = os.path.join('checkpoints', opt.savename, 'resume_state.pth')
@@ -211,6 +223,7 @@ if __name__ == '__main__':
         lossfun_GANG = BVDNet.GANLoss('G')
 
     start_iter = 0
+    ctrl_state = {'best_score': 1e9, 'stale_windows': 0, 'cooldown': 0}
     if opt.continue_train:
         import re, json
         _ckpts = []
@@ -255,6 +268,29 @@ if __name__ == '__main__':
     '''
     --------------------------Init DataLoader--------------------------
     '''
+    base_hp = {
+        'lr': float(opt.lr),
+        'lambda_L2': float(opt.lambda_L2),
+        'lambda_VGG': float(opt.lambda_VGG),
+        'lambda_temp': float(opt.lambda_temp),
+        'lambda_GAN': float(opt.lambda_GAN),
+    }
+    if opt.continue_train and os.path.exists(os.path.join(dir_checkpoint, 'resume_state.pth')):
+        try:
+            _st = torch.load(os.path.join(dir_checkpoint, 'resume_state.pth'), map_location='cpu')
+            if 'adaptive_hp' in _st:
+                for _k, _v in _st['adaptive_hp'].items():
+                    setattr(opt, _k, float(_v))
+                for _pg in optimizer_G.param_groups:
+                    _pg['lr'] = opt.lr
+                if not opt.no_gan:
+                    for _pg in optimizer_D.param_groups:
+                        _pg['lr'] = opt.lr
+            if 'ctrl_state' in _st:
+                ctrl_state.update(_st['ctrl_state'])
+        except Exception:
+            pass
+    
     videolist_tmp = os.listdir(opt.dataset)
     videolist = []
     for video in videolist_tmp:
@@ -321,6 +357,9 @@ if __name__ == '__main__':
           f"Starting up to {opt.load_thread} + {n_eval_workers} data-loading processes...", flush=True)
     Videodataloader_train = dataloader.VideoDataLoader(opt, videolist_train)
     Videodataloader_eval = dataloader.VideoDataLoader(opt, videolist_eval, n_workers=n_eval_workers)
+    iters_per_epoch = max(1, Videodataloader_train.n_iter // max(1, opt.n_epoch))
+    target_cadence = max(3000, iters_per_epoch // 2)
+    ctrl_interval = max(opt.save_freq, int(round(target_cadence / max(1, opt.save_freq))) * opt.save_freq)
     print(f"Length of this run: {Videodataloader_train.n_iter:,} iterations = {len(videolist_train)} clips x "
           f"{Videodataloader_train.each_video_n_iter} iterations per clip x {opt.n_epoch} epochs / batch {opt.batchsize}. "
           f"A checkpoint is saved every {opt.save_freq:,} iterations and can be used at any point; lower --n_epoch for a shorter run.",
@@ -366,9 +405,11 @@ if __name__ == '__main__':
             dis_fake_D = netD(torch.cat((mosaic_stream[:,:,opt.N],out.detach()),dim=1))
             loss_D = lossfun_GAND(dis_fake_D,dis_real) * opt.lambda_GAN * opt.lambda_D
         # Generator
-        loss_L2 = lossfun_L2(out,ori_stream[:,:,opt.N]) * opt.lambda_L2
-        loss_VGG = lossfun_VGG(out,ori_stream[:,:,opt.N]) * opt.lambda_VGG
-        loss_G = loss_L2+loss_VGG
+        loss_L2 = lossfun_L2(out, ori_stream[:, :, opt.N]) * opt.lambda_L2
+        loss_VGG = lossfun_VGG(out, ori_stream[:, :, opt.N]) * opt.lambda_VGG
+        prev_gt = ori_stream[:, :, opt.N - 1]
+        loss_temp = torch.mean(torch.abs((out - prev_gt) - (ori_stream[:, :, opt.N] - prev_gt))) * opt.lambda_temp
+        loss_G = loss_L2 + loss_VGG + loss_temp
         if not opt.no_gan:
             dis_fake_G = netD(torch.cat((mosaic_stream[:,:,opt.N],out),dim=1))
             loss_GANG = lossfun_GANG(dis_fake_G) * opt.lambda_GAN
@@ -388,9 +429,9 @@ if __name__ == '__main__':
 
         if not opt.no_gan:
             TBGlobalWriter.add_scalars('loss/train', {'L2':loss_L2.item(),'VGG':loss_VGG.item(),
-                'loss_D':loss_D.item(),'loss_G':loss_G.item()}, train_iter)
+                'loss_D':loss_D.item(),'loss_G':loss_G.item(),'Temp': loss_temp.item()}, train_iter)
         else:
-            TBGlobalWriter.add_scalars('loss/train', {'L2':loss_L2.item(),'VGG':loss_VGG.item()}, train_iter)
+            TBGlobalWriter.add_scalars('loss/train', {'L2':loss_L2.item(),'VGG':loss_VGG.item(), 'Temp': loss_temp.item()}, train_iter)
 
         # Live per-iteration feedback on the progress bar itself, distinct from
         # the much rarer (every --showresult_freq iters) detailed print below.
@@ -424,6 +465,57 @@ if __name__ == '__main__':
 
         # save network
         if train_iter%opt.save_freq == 0 and train_iter != 0:
+            if opt.adaptive_loss and train_iter > 0 and train_iter % ctrl_interval == 0:
+                n_eval_batches = min(12, max(4, len(videolist_eval) // max(1, opt.batchsize)))
+                v_vgg, v_sharp, v_flick = 0.0, 0.0, 0.0
+                with torch.no_grad():
+                    for _ in range(n_eval_batches):
+                        eo, em, ep = Videodataloader_eval.get_data()
+                        eo = data.to_tensor(eo, opt.gpu_id, device=_device_for_calls)
+                        em = data.to_tensor(em, opt.gpu_id, device=_device_for_calls)
+                        ep = eo[:, :, opt.N - 1] if ep is None else data.to_tensor(ep, opt.gpu_id, device=_device_for_calls)
+                        eout = netG(em, ep)
+                        v_vgg += float(lossfun_VGG(eout, eo[:, :, opt.N]).item())
+                        v_sharp += float((_grad_mag_batch(eout).mean() / _grad_mag_batch(eo[:, :, opt.N]).mean().clamp_min(1e-5)).item())
+                        v_flick += float(torch.mean(torch.abs((eout - eo[:, :, opt.N - 1]) - (eo[:, :, opt.N] - eo[:, :, opt.N - 1]))).item() * 127.5)
+                v_vgg /= n_eval_batches
+                v_sharp /= n_eval_batches
+                v_flick /= n_eval_batches
+
+                if v_sharp < 0.78:
+                    opt.lambda_VGG = min(base_hp['lambda_VGG'] * 2.0, opt.lambda_VGG * 1.08)
+                    opt.lambda_L2 = max(base_hp['lambda_L2'] * 0.4, opt.lambda_L2 * 0.95)
+                elif v_sharp > 0.96:
+                    opt.lambda_VGG = max(base_hp['lambda_VGG'] * 0.6, opt.lambda_VGG * 0.93)
+                    opt.lambda_L2 = min(base_hp['lambda_L2'] * 1.5, opt.lambda_L2 * 1.04)
+
+                if v_flick > 4.2:
+                    opt.lambda_temp = min(base_hp['lambda_temp'] * 2.5, opt.lambda_temp * 1.10)
+                if not opt.no_gan and loss_D.item() < 0.008:
+                    opt.lambda_GAN = max(base_hp['lambda_GAN'] * 0.35, opt.lambda_GAN * 0.88)
+
+                perceptual_obj = v_vgg + 0.04 * v_flick
+                if perceptual_obj < ctrl_state['best_score'] * 0.992:
+                    ctrl_state['best_score'] = perceptual_obj
+                    ctrl_state['stale_windows'] = 0
+                else:
+                    ctrl_state['stale_windows'] += 1
+
+                if ctrl_state['cooldown'] > 0:
+                    ctrl_state['cooldown'] -= 1
+                elif ctrl_state['stale_windows'] >= 2:
+                    opt.lr = max(1e-5, opt.lr * 0.80)
+                    for _pg in optimizer_G.param_groups:
+                        _pg['lr'] = opt.lr
+                    if not opt.no_gan:
+                        for _pg in optimizer_D.param_groups:
+                            _pg['lr'] = opt.lr
+                    ctrl_state['stale_windows'] = 0
+                    ctrl_state['cooldown'] = 2
+
+                TBGlobalWriter.add_scalars('controller/eval', {'sharp_ret': v_sharp, 'flicker_mae': v_flick, 'vgg': v_vgg}, train_iter)
+                TBGlobalWriter.add_scalars('controller/hp', {'vgg': opt.lambda_VGG, 'L2': opt.lambda_L2, 'temp': opt.lambda_temp, 'lr_1e4': opt.lr * 1e4}, train_iter)
+                tqdm.write(f"[ctrl @{train_iter}] SharpRet={v_sharp*100:.1f}% Flick={v_flick:.2f} -> VGG={opt.lambda_VGG:.2f} L2={opt.lambda_L2:.1f} Temp={opt.lambda_temp:.1f} lr={opt.lr:.2e}")
             save_generator(os.path.join('checkpoints',opt.savename,str(train_iter)+'_G.pth'))
             if not opt.no_gan:
                 model_util.save(netD, os.path.join('checkpoints',opt.savename,str(train_iter)+'_D.pth'), opt.gpu_id, device=_device_for_calls)
@@ -432,7 +524,7 @@ if __name__ == '__main__':
         # Image quality evaluation 
         if train_iter%(opt.showresult_freq//10) == 0:
             ImageQualityEvaluation(out,ori_stream[:,:,opt.N],train_iter,TBGlobalWriter,'train')
-
+        
         # Show result
         if train_iter % opt.showresult_freq == 0:
             ShowImage(mosaic_stream[:,:,opt.N],out,ori_stream[:,:,opt.N],train_iter,opt.showresult_num,TBGlobalWriter,'train')

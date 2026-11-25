@@ -54,6 +54,8 @@ from tools.filter_subtitled_scenes import (
     crop_overlaps_boxes,
     MIN_FRAMES as SUB_MIN_FRAMES,
 )
+from util.video_sync import resolve_pair_cfr, align_pair_folders_dtw, discover_groups, match_group
+
 
 
 def find_pairs(censored_dir, uncensored_dir):
@@ -84,6 +86,38 @@ def _edge_median(values, window):
     padded = np.pad(values, pad, mode='edge')
     return np.array([np.median(padded[i:i + window]) for i in range(len(values))], dtype=values.dtype)
 
+def _match_scene_color_to_origin(cropped_pairs, dirty_flags, masks_small):
+    """Apply one constant scene-wide per-channel mean/std color transform to mosaic crops
+    using ONLY unmasked outer-border pixels (mask == 0), matching origin color space cleanly."""
+    o_px, m_px = [], []
+    for i, pair in enumerate(cropped_pairs):
+        if dirty_flags[i] or pair is None:
+            continue
+        orig_bgr, mos_bgr = pair
+        bg = masks_small[i] == 0
+        if int(np.sum(bg)) < 256:
+            continue
+        o_px.append(orig_bgr[bg].astype(np.float32))
+        m_px.append(mos_bgr[bg].astype(np.float32))
+    if not o_px:
+        return cropped_pairs
+
+    o_all = np.concatenate(o_px, axis=0)
+    m_all = np.concatenate(m_px, axis=0)
+    o_mean, o_std = o_all.mean(axis=0), o_all.std(axis=0)
+    m_mean, m_std = m_all.mean(axis=0), m_all.std(axis=0)
+    gain = np.where(m_std > 1.0, o_std / m_std, 1.0)
+    gain = np.clip(gain, 0.75, 1.35)  # guard against extreme outlier shifts
+
+    out_pairs = []
+    for i, pair in enumerate(cropped_pairs):
+        if dirty_flags[i] or pair is None:
+            out_pairs.append(pair)
+            continue
+        orig_bgr, mos_bgr = pair
+        adj = (mos_bgr.astype(np.float32) - m_mean) * gain + o_mean
+        out_pairs.append((orig_bgr, np.clip(adj, 0, 255).astype(np.uint8)))
+    return out_pairs
 
 def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
                         ex_range=(1.2, 1.7), min_frames=100,
@@ -103,6 +137,7 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
     batch_size = 16
 
     pbar_loc = tqdm(total=n, desc='  locating mosaic', leave=False, disable=not show_pbar)
+    raw_masks = [None] * n
     for start_i in range(0, n, batch_size):
         chunk_names = names[start_i:start_i + batch_size]
         chunk_imgs = []
@@ -130,6 +165,7 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
             for idx, (mask, x, y, size) in zip(valid_indices, dets):
                 if mask is not None and size > min_size:
                     pos[idx] = (x, y, size)
+                    raw_masks[idx] = mask
 
         pbar_loc.update(len(chunk_names))
     pbar_loc.close()
@@ -157,6 +193,7 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
 
     dirty_flags = []
     cropped_pairs = []
+    masks_small = []
     sides, size_mismatch = [], False
 
     for i, name in enumerate(tqdm(names, desc='  Cropping Mosaic area', leave=False, disable=not show_pbar)):
@@ -165,6 +202,7 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
         if mosaic is None or origin is None:
             dirty_flags.append(True)
             cropped_pairs.append(None)
+            masks_small.append(None)
             continue
         h, w = mosaic.shape[:2]
         if origin.shape[:2] != (h, w):
@@ -177,6 +215,7 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
         if i < len(overlay_boxes) and crop_overlaps_boxes(crop_rect, overlay_boxes[i]):
             dirty_flags.append(True)
             cropped_pairs.append(None)
+            masks_small.append(None)
             continue
 
         dirty_flags.append(False)
@@ -186,6 +225,8 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
             cv2.resize(origin[box], (outsize, outsize), interpolation=interp),
             cv2.resize(mosaic[box], (outsize, outsize), interpolation=interp),
         ))
+        mask_crop = raw_masks[i][box] if i < len(raw_masks) and raw_masks[i] is not None else np.zeros((2 * half, 2 * half), dtype=np.uint8)
+        masks_small.append(cv2.resize(mask_crop, (outsize, outsize), interpolation=cv2.INTER_NEAREST))
         sides.append(2 * half)
 
     # Clear raw full-size frames and keep only clean runs >= min_frames
@@ -202,6 +243,8 @@ def crop_pair_to_mosaic(netM, opt, origin_dir, mosaic_dir, outsize,
         return None, f"overlay overlap dropped {n_ovl}/{len(dirty_flags)} frames (0 clean runs >= {min_frames}f)"
 
     parent_dir = os.path.dirname(origin_dir)
+
+    cropped_pairs = _match_scene_color_to_origin(cropped_pairs, dirty_flags, masks_small)
     for r_idx, (s_i, e_i) in enumerate(runs):
         if len(runs) == 1 and r_idx == 0:
             cur_orig, cur_mos = origin_dir, mosaic_dir
@@ -293,19 +336,22 @@ def _split_subtitles_in_place(bucket_dir, min_frames=SUB_MIN_FRAMES):
     shutil.rmtree(bucket_dir, ignore_errors=True)
     return len(runs)
 
+def _fmt_stamp_ms(sec):
+    s = max(0.0, float(sec))
+    return f"{int(s // 3600):02d}:{int((s % 3600) // 60):02d}:{s % 60:06.3f}"
+
+
 def extract_frames(videopath, out_dir, fps, start_sec=None, duration_sec=None):
-    """Extract frames from `videopath` into `out_dir` (%05d.jpg)."""
+    """Extract frames from `videopath` into `out_dir` (%05d.jpg) with sub-second precision."""
     util_.makedirs(out_dir)
     out_pattern = os.path.join(out_dir, '%05d.jpg')
     if start_sec is not None and duration_sec is not None:
-        start_stamp = util_.second2stamp(int(start_sec))
-        last_stamp = util_.second2stamp(max(1, int(round(duration_sec))))
         ffmpeg_util.video2image(
             videopath,
             out_pattern,
             fps=fps,
-            start_time=start_stamp,
-            last_time=last_stamp,
+            start_time=_fmt_stamp_ms(start_sec),
+            last_time=_fmt_stamp_ms(max(0.1, float(duration_sec))),
         )
     else:
         ffmpeg_util.video2image(videopath, out_pattern, fps=fps)
@@ -495,26 +541,20 @@ def _find_existing_pair_scenes(output_dir, pair_name):
 
 def main():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument('--censored_dir', required=True, help='folder of real censored clips')
-    parser.add_argument('--uncensored_dir', required=True, help='folder of matching uncensored clips (same filenames)')
+    parser.add_argument('--censored_dir', required=True, help='folder of real censored clips or subfolders')
+    parser.add_argument('--uncensored_dir', required=True, help='folder of matching uncensored clips or subfolders')
     parser.add_argument('--output_dir', required=True)
-    parser.add_argument('--fps', type=int, default=15)
+    parser.add_argument('--fps', type=int, default=0, help='target FPS (0 = auto matched native CFR, >0 = manual override)')
     parser.add_argument('--min_frames', type=int, default=100)
     parser.add_argument('--n_samples', type=int, default=8)
     parser.add_argument('--outsize', type=int, default=572)
     parser.add_argument('--no_crop', action='store_true')
     parser.add_argument('--reuse_uncensored_for_synthetic', choices=['ask', 'yes', 'no'], default='ask')
-    parser.add_argument('--scan_stride_sec', type=float, default=2.0)
-    parser.add_argument('--max_gap_sec', type=float, default=5.0)
-    parser.add_argument('--min_scene_sec', type=float, default=3.0)
     parser.add_argument('--yolo_conf', type=float, default=0.35)
     parser.add_argument('--synthetic_source_dir', default=os.path.join('datasets', 'raw', 'synthetic_source'))
-    parser.add_argument('--workers', type=int, default=2,
-                        help='parallel worker threads for FFmpeg extraction & cropping (default: 2)')
-    parser.add_argument('--no_resume', action='store_true',
-                        help='reprocess all pairs from scratch instead of skipping already-completed pairs')
-    parser.add_argument('--gui_progress', action='store_true',
-                        help='emit machine-readable @@PROGRESS lines and suppress tqdm bars for GUI log cleanliness')
+    parser.add_argument('--workers', type=int, default=2)
+    parser.add_argument('--no_resume', action='store_true')
+    parser.add_argument('--gui_progress', action='store_true')
     known, remaining = parser.parse_known_args()
 
     sys.argv = [sys.argv[0]] + remaining
@@ -525,251 +565,178 @@ def main():
     opt = Options().getparse(test_flag=True)
     opt.yolo_conf = known.yolo_conf
 
-    if not os.path.isdir(known.censored_dir):
-        print(f"--censored_dir not found: {known.censored_dir}")
-        sys.exit(1)
-    if not os.path.isdir(known.uncensored_dir):
-        print(f"--uncensored_dir not found: {known.uncensored_dir}")
+    if not os.path.isdir(known.censored_dir) or not os.path.isdir(known.uncensored_dir):
+        print("Error: --censored_dir or --uncensored_dir not found.")
         sys.exit(1)
 
-    print("Loading mosaic-position model...")
     if opt.mosaic_position_model_path.lower().endswith(('.pt', '.onnx')):
         netM = YoloMosaicDetector(opt.mosaic_position_model_path, conf_thresh=known.yolo_conf)
     else:
         netM = loadmodel.bisenet(opt, 'mosaic')
 
     manifest_path = opt.model_manifest
-    if not os.path.exists(manifest_path):
-        print(f"--model_manifest not found at {manifest_path}.")
-        sys.exit(1)
     manifest = loadmodel.load_size_manifest(manifest_path)
     min_pct, max_pct = min(manifest.keys()), max(manifest.keys())
     print(f"Bucket range from manifest: {min_pct:g}%-{max_pct:g}%")
 
-    pairs = find_pairs(known.censored_dir, known.uncensored_dir)
-    if not pairs:
-        print("No matching filenames found between --censored_dir and --uncensored_dir.")
+    groups = discover_groups(known.censored_dir, known.uncensored_dir)
+    if not groups:
+        print("No matching subfolders or root video filenames found.")
         sys.exit(1)
 
-    maybe_reuse_uncensored(pairs, known.reuse_uncensored_for_synthetic, known.synthetic_source_dir)
+    # Link/copy raw uncensored files cleanly if requested (never modifies raw source)
+    raw_pairs = [(lbl, c_list[0], u_list[0]) for lbl, c_list, u_list in groups if len(c_list) == 1 and len(u_list) == 1]
+    maybe_reuse_uncensored(raw_pairs, known.reuse_uncensored_for_synthetic, known.synthetic_source_dir)
 
     os.makedirs(known.output_dir, exist_ok=True)
     done_dir = os.path.join(known.output_dir, '.done')
     os.makedirs(done_dir, exist_ok=True)
 
-    all_pair_names = [p[0] for p in pairs]
-    if known.no_resume:
-        for name in all_pair_names:
-            sentinel = os.path.join(done_dir, f"{name}.done")
-            if os.path.exists(sentinel):
-                os.remove(sentinel)
-            _cleanup_partial_pair(known.output_dir, name)
-        todo_pairs = pairs
-        skipped_count = 0
-    else:
-        todo_pairs = []
-        skipped_count = 0
-        existing_by_pair = {}
-        latest_mtime = -1.0
-        latest_pair = None
-        for name, _, _ in pairs:
-            sentinel = os.path.join(done_dir, f"{name}.done")
-            if os.path.exists(sentinel):
-                continue
-            scenes_on_disk = _find_existing_pair_scenes(known.output_dir, name)
-            if scenes_on_disk:
-                existing_by_pair[name] = scenes_on_disk
-                for sc_name, _, b_val in scenes_on_disk:
-                    p_dir = os.path.join(known.output_dir, f"bucket_{b_val:g}", sc_name)
-                    mt = os.path.getmtime(p_dir)
-                    if mt > latest_mtime:
-                        latest_mtime = mt
-                        latest_pair = name
-
-        if existing_by_pair:
-            for name, scenes_on_disk in existing_by_pair.items():
-                if name == latest_pair:
-                    print(f"Resume check: re-verifying last in-flight pair '{name}'...")
-                    _cleanup_partial_pair(known.output_dir, name)
-                else:
-                    with open(os.path.join(done_dir, f"{name}.done"), 'w', encoding='utf-8') as f:
-                        f.write(f"adopted {len(scenes_on_disk)} scene(s)\n")
-
-        for item in pairs:
-            name = item[0]
-            if os.path.exists(os.path.join(done_dir, f"{name}.done")):
-                skipped_count += 1
-            else:
-                _cleanup_partial_pair(known.output_dir, name)
-                todo_pairs.append(item)
+    todo_groups = []
+    skipped = 0
+    for item in groups:
+        lbl = item[0]
+        sentinel = os.path.join(done_dir, f"{lbl}.done")
+        if known.no_resume and os.path.exists(sentinel):
+            os.remove(sentinel)
+        if not known.no_resume and os.path.exists(sentinel):
+            skipped += 1
+        else:
+            _cleanup_partial_pair(known.output_dir, lbl)
+            todo_groups.append(item)
 
     workers = max(1, min(int(known.workers), 8))
     use_gui = bool(known.gui_progress)
     show_inner_pbar = (workers == 1) and (not use_gui)
-
-    print(f"Found {len(pairs)} pair(s) total — {skipped_count} already completed, "
-          f"{len(todo_pairs)} to process (workers={workers}).")
-
-    if not todo_pairs:
-        print("All pairs are already completed!")
+    print(f"Found {len(groups)} group(s) — {skipped} completed, {len(todo_groups)} to process (workers={workers}).")
+    if not todo_groups:
         return
 
     gpu_lock = threading.Lock()
     state_lock = threading.Lock()
     slot_pool = list(range(workers))
-    worker_slots = {}  # slot_idx -> "W1: name [stage]@pct"
-    completed_pairs = 0
-    total_todo = len(todo_pairs)
+    worker_slots = {}
+    completed = 0
+    total_todo = len(todo_groups)
     results = []
 
-    def emit_gui_progress(msg=""):
-        if not use_gui:
-            return
-        with state_lock:
-            w_str = ";".join(worker_slots[k] for k in sorted(worker_slots))
-            done_n = completed_pairs
-        print(f"@@PROGRESS|done={done_n}|total={total_todo}|workers={w_str}|msg={msg}", flush=True)
+    def emit_gui(msg=""):
+        if use_gui:
+            with state_lock:
+                w_str = ";".join(worker_slots[k] for k in sorted(worker_slots))
+                dn = completed
+            print(f"@@PROGRESS|done={dn}|total={total_todo}|workers={w_str}|msg={msg}", flush=True)
 
-    def set_worker_status(slot, name, stage, pct=None):
+    def set_slot(slot, name, stage, pct=None):
         short = name if len(name) <= 22 else name[:19] + "..."
-        pct_part = f"@{pct}" if pct is not None else "@"
         with state_lock:
-            worker_slots[slot] = f"W{slot + 1}: {short} [{stage}]{pct_part}"
-        emit_gui_progress()
+            worker_slots[slot] = f"W{slot + 1}: {short} [{stage}]@{pct if pct is not None else ''}"
+        emit_gui()
 
-    def process_one_pair(pair_tuple):
-        nonlocal completed_pairs
-        name, censored_path, uncensored_path = pair_tuple
+    def process_one_group(g_item):
+        nonlocal completed
+        label, cen_paths, unc_paths = g_item
         t0 = time.time()
-
         with state_lock:
             slot = slot_pool.pop(0)
-        set_worker_status(slot, name, "scan", 0)
-
-        pair_logs = []
-        pair_results = []
+        set_slot(slot, label, "sync", 0)
+        logs, g_res = [], []
         try:
-            scenes = detect_pct(
-                opt, netM, censored_path, known.n_samples, min_pct, max_pct,
-                scan_stride_sec=known.scan_stride_sec,
-                max_gap_sec=known.max_gap_sec,
-                min_scene_sec=known.min_scene_sec,
-                gpu_lock=gpu_lock,
-                show_pbar=show_inner_pbar,
-                progress_cb=lambda p: set_worker_status(slot, name, "scan", p),
-            )
-
+            qc_dir = os.path.join(known.output_dir, '_sync_qc')
+            scenes = match_group(label, cen_paths, unc_paths, qc_dir, export_dir=None)
             if not scenes:
-                pair_logs.append(f"  {name}: no censored scenes detected, skipped.")
-            else:
-                kept = 0
-                for scene_idx, sc in enumerate(scenes):
-                    est_frames = int(round(sc['duration'] * known.fps))
-                    if est_frames < known.min_frames:
-                        pair_logs.append(f"    scene {scene_idx:03d}: skipped (duration {sc['duration']:.1f}s -> ~{est_frames}f < min_frames={known.min_frames})")
+                logs.append(f"  {label}: 0 matched scenes.")
+            mos_by_file = {
+                os.path.basename(cp): detect_pct(opt, netM, cp, known.n_samples, min_pct, max_pct, gpu_lock=gpu_lock, show_pbar=False)
+                for cp in cen_paths
+            }
+            sub_scenes = []
+            for sc in scenes:
+                m_list = mos_by_file.get(sc['cen_source'], [])
+                c0, c1 = sc['cen_start'], sc['cen_start'] + sc['duration']
+                off = sc['unc_start'] - sc['cen_start']
+                for msc in m_list:
+                    ov0 = max(c0, msc['start'])
+                    ov1 = min(c1, msc['start'] + msc['duration'])
+                    if ov1 - ov0 < 4.5:
                         continue
+                    cur_t = ov0
+                    while cur_t < ov1 - 4.0:
+                        seg_dur = min(45.0, ov1 - cur_t)
+                        sub_scenes.append({
+                            'clip_name': f"{os.path.splitext(sc['clip_name'])[0]}_m{len(sub_scenes):03d}.mp4",
+                            'cen_source': sc['cen_source'],
+                            'unc_source': sc['unc_source'],
+                            'cen_start': round(cur_t, 4),
+                            'unc_start': round(cur_t + off, 4),
+                            'duration': round(seg_dur, 4),
+                            'pct': msc['pct'],
+                        })
+                        cur_t += seg_dur
 
-                    set_worker_status(slot, name, f"scene {scene_idx + 1}/{len(scenes)}")
-                    clip_name = f"{name}_scene{scene_idx:03d}"
-                    stage_dir = os.path.join(known.output_dir, '_staging', clip_name)
-                    origin_dir = os.path.join(stage_dir, 'origin_image')
-                    mosaic_dir = os.path.join(stage_dir, 'mosaic_image')
+            for s_idx, sc in enumerate(sub_scenes):
+                set_slot(slot, label, f"scene {s_idx + 1}/{len(sub_scenes)}", int(100 * s_idx / max(1, len(sub_scenes))))
+                cen_src = next(p for p in cen_paths if os.path.basename(p) == sc['cen_source'])
+                unc_src = next(p for p in unc_paths if os.path.basename(p) == sc['unc_source'])
+                scene_fps = float(known.fps) if known.fps > 0 else resolve_pair_cfr(cen_src, unc_src)
+                if sc['duration'] * scene_fps < known.min_frames:
+                    continue
 
-                    extract_frames(uncensored_path, origin_dir, known.fps,
-                                   start_sec=sc['start'], duration_sec=sc['duration'])
-                    extract_frames(censored_path, mosaic_dir, known.fps,
-                                   start_sec=sc['start'], duration_sec=sc['duration'])
+                clip_tag = os.path.splitext(sc['clip_name'])[0]
+                stage_dir = os.path.join(known.output_dir, '_staging', clip_tag)
+                origin_dir = os.path.join(stage_dir, 'origin_image')
+                mosaic_dir = os.path.join(stage_dir, 'mosaic_image')
+                extract_frames(unc_src, origin_dir, scene_fps, start_sec=sc['unc_start'], duration_sec=sc['duration'])
+                extract_frames(cen_src, mosaic_dir, scene_fps, start_sec=sc['cen_start'], duration_sec=sc['duration'])
 
-                    n_orig = len(os.listdir(origin_dir))
-                    n_mosaic = len(os.listdir(mosaic_dir))
-                    warn = ""
-                    if n_orig != n_mosaic:
-                        warn = f" [WARN: frame mismatch orig={n_orig} vs mos={n_mosaic}]"
+                ok_sync, _, sync_info = align_pair_folders_dtw(origin_dir, mosaic_dir, max_band=3, min_mean_corr=0.80)
+                if not ok_sync:
+                    shutil.rmtree(stage_dir, ignore_errors=True)
+                    logs.append(f"    {clip_tag}: skipped ({sync_info})")
+                    continue
 
-                    if not known.no_crop:
-                        stats, skip_reason = crop_pair_to_mosaic(
-                            netM, opt, origin_dir, mosaic_dir, known.outsize,
-                            min_frames=known.min_frames,
-                            gpu_lock=gpu_lock,
-                            show_pbar=show_inner_pbar,
-                        )
-                        if stats is None:
-                            shutil.rmtree(stage_dir, ignore_errors=True)
-                            pair_logs.append(f"    scene {scene_idx:03d}: skipped ({skip_reason})")
-                            continue
-                        stage_dirs = sorted(glob.glob(f"{stage_dir}*"))
-                        if not stage_dirs:
-                            pair_logs.append(f"    scene {scene_idx:03d}: skipped (no staging folders remained after crop)")
-                            continue
-                        sub_total = 0
-                        for sd in stage_dirs:
-                            sub_name = os.path.basename(sd)
-                            post_pct = _measure_postcrop_scene_pct(sd, min_pct, max_pct, sc['pct'])
-                            _, bucket = loadmodel.select_model_by_pct(post_pct, manifest_path)
-                            bucket_dir = os.path.join(known.output_dir, f'bucket_{bucket:g}', sub_name)
-                            os.makedirs(os.path.dirname(bucket_dir), exist_ok=True)
-                            shutil.move(sd, bucket_dir)
-                            n_clean = _split_subtitles_in_place(bucket_dir, min_frames=known.min_frames)
-                            sub_total += n_clean
-                            if n_clean > 0:
-                                pair_results.append((sub_name, post_pct, bucket))
-                        if sub_total == 0:
-                            pair_logs.append(f"    scene {scene_idx:03d}: skipped (post-crop subtitle filter left 0 runs >= {known.min_frames}f)")
-                            continue
-                        sub_note = f" -> {sub_total} clean sub-clip(s)" if sub_total > 1 else ""
-                        pair_logs.append(
-                            f"    scene {scene_idx:03d}: post-crop pct={post_pct:.2f}% (pre={sc['pct']:.2f}%) "
-                            f"-> bucket {bucket:g}% | {stats['frames']} frames, median {stats['median_side']}px{warn}{sub_note}"
-                        )
-                    else:
-                        post_pct = sc['pct']
-                        _, bucket = loadmodel.select_model_by_pct(post_pct, manifest_path)
-                        bucket_dir = os.path.join(known.output_dir, f'bucket_{bucket:g}', clip_name)
-                        os.makedirs(os.path.dirname(bucket_dir), exist_ok=True)
-                        shutil.move(stage_dir, bucket_dir)
-                        pair_logs.append(
-                            f"    scene {scene_idx:03d}: pct={post_pct:.2f}% (conf={sc['confidence']:.2f}) "
-                            f"-> bucket {bucket:g}% | {n_orig} full frames{warn}"
-                        )
-                        pair_results.append((clip_name, post_pct, bucket))
+                stats, skip_reason = crop_pair_to_mosaic(
+                    netM, opt, origin_dir, mosaic_dir, known.outsize,
+                    min_frames=known.min_frames, gpu_lock=gpu_lock, show_pbar=show_inner_pbar,
+                )
+                if stats is None:
+                    shutil.rmtree(stage_dir, ignore_errors=True)
+                    logs.append(f"    {clip_tag}: skipped ({skip_reason})")
+                    continue
 
-                    
-                    kept += 1
+                for sd in sorted(glob.glob(f"{stage_dir}*")):
+                    sub_name = os.path.basename(sd)
+                    post_pct = _measure_postcrop_scene_pct(sd, min_pct, max_pct, sc['pct'])
+                    _, bucket = loadmodel.select_model_by_pct(post_pct, manifest_path)
+                    bucket_dir = os.path.join(known.output_dir, f'bucket_{bucket:g}', sub_name)
+                    os.makedirs(os.path.dirname(bucket_dir), exist_ok=True)
+                    shutil.move(sd, bucket_dir)
+                    n_clean = _split_subtitles_in_place(bucket_dir, min_frames=known.min_frames)
+                    if n_clean > 0:
+                        g_res.append((sub_name, post_pct, bucket))
+                        logs.append(f"    {sub_name}: fps={scene_fps:.3f} {sync_info} pct={post_pct:.2f}% -> bucket {bucket:g}% (+{n_clean})")
 
-                if kept == 0:
-                    pair_logs.append(f"  {name}: {len(scenes)} scene(s) found, none met min_frames={known.min_frames}.")
-
-            with open(os.path.join(done_dir, f"{name}.done"), 'w', encoding='utf-8') as f:
-                f.write(f"ok scenes={len(pair_results)}\n")
-        except Exception as e: pair_logs.append(f"  [ERROR] {name}: {e}")
+            with open(os.path.join(done_dir, f"{label}.done"), 'w', encoding='utf-8') as f:
+                f.write(f"ok clips={len(g_res)}\n")
+        except Exception as e:
+            logs.append(f"  [ERROR] {label}: {e}")
         finally:
-            dt = time.time() - t0
             with state_lock:
                 worker_slots.pop(slot, None)
                 slot_pool.append(slot)
                 slot_pool.sort()
-                completed_pairs += 1
-                idx_now = completed_pairs
-                results.extend(pair_results)
+                completed += 1
+                idx_now = completed
+                results.extend(g_res)
+            print("\n".join([f"[{idx_now}/{total_todo}] {label} ({time.time() - t0:.1f}s) -> {len(g_res)} clip(s)"] + logs), flush=True)
+            emit_gui(f"last: {label} ({len(g_res)} clip(s))")
 
-            header = f"[{idx_now}/{total_todo}] {name} ({dt:.1f}s) -> {len(pair_results)} clip(s)"
-            print("\n".join([header] + pair_logs), flush=True)
-            emit_gui_progress(f"last: {name} ({len(pair_results)} clip(s))")
-
-    emit_gui_progress("starting workers")
+    emit_gui("starting workers")
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(process_one_pair, p) for p in todo_pairs]
-        for fut in as_completed(futures):
+        for fut in as_completed([pool.submit(process_one_group, g) for g in todo_groups]):
             fut.result()
 
-    print("\n=== Summary ===")
-    bucket_counts = {}
-    for clip_name, pct, b in results:
-        print(f"  {clip_name}: {pct:.2f}% -> bucket {b:g}%")
-        bucket_counts[b] = bucket_counts.get(b, 0) + 1
-    for b in sorted(bucket_counts):
-        print(f"  Bucket {b:g}%: +{bucket_counts[b]} scene(s)")
-    print(f"\nDone. {len(results)} new scene(s) from {total_todo} pair(s) bucketed under {known.output_dir}/bucket_<N>/")
+    print(f"\nDone. {len(results)} clean scene(s) from {total_todo} group(s) bucketed under {known.output_dir}/bucket_<N>/")
 
 
 if __name__ == '__main__':

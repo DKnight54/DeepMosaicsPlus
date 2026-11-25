@@ -51,6 +51,7 @@ except Exception:
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from util import diagnose
+from models.loadmodel import load_size_manifest_details
 
 
 def link_or_copy(src, dst):
@@ -167,24 +168,15 @@ def resolve_python_exe():
 
 def main():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument('--synthetic_dataset', default=None,
-        help='shared pool of origin_image/+mask/ folders (the OUTPUT of make_datasets/'
-             'make_video_dataset.py, not your raw source videos), reused for every bucket. '
-             'Optional — omit this, or point it at an empty/nonexistent folder, to train purely '
-             'from real-pair data (see --real_pairs_dataset) with no synthetic mosaics at all.')
-    parser.add_argument('--real_pairs_dataset', default=None,
-        help='output of tools/bucket_real_pairs.py (contains bucket_<N>/ subfolders)')
-    parser.add_argument('--model_manifest', default=os.path.join('pretrained_models','mosaic','size_manifest.json'))
+    parser.add_argument('--synthetic_dataset', default=None)
+    parser.add_argument('--real_pairs_dataset', default=None)
+    parser.add_argument('--model_manifest', default=os.path.join('pretrained_models', 'mosaic', 'size_manifest.json'))
     parser.add_argument('--work_dir', default=os.path.join('datasets', '_merged'))
     parser.add_argument('--train_script', default=os.path.join('train', 'clean', 'train.py'))
-    parser.add_argument('--buckets', default=None,
-        help='comma-separated subset of buckets to run, e.g. "1,3" — default: all buckets in the manifest')
-    parser.add_argument('--redo_finished', action='store_true',
-        help='train buckets again even if they already finished (by default finished buckets are skipped, '
-             'so a run that was interrupted continues with the first unfinished bucket)')
-    parser.add_argument('--no_resume', action='store_true',
-        help='train an unfinished bucket from the start instead of resuming it from its newest checkpoint')
-    parser.add_argument('--dry_run', action='store_true', help='build merged folders and print commands, but do not actually launch training')
+    parser.add_argument('--buckets', default=None)
+    parser.add_argument('--redo_finished', action='store_true')
+    parser.add_argument('--no_resume', action='store_true')
+    parser.add_argument('--dry_run', action='store_true')
     args, train_args = parser.parse_known_args()
     if train_args and train_args[0] == '--':
         train_args = train_args[1:]
@@ -192,12 +184,16 @@ def main():
     if not os.path.exists(args.model_manifest):
         print(f"--model_manifest not found at {args.model_manifest}")
         sys.exit(1)
-    with open(args.model_manifest) as f:
-        manifest = json.load(f)
-    bucket_labels = list(manifest.keys())
+
+    raw_details = load_size_manifest_details(args.model_manifest)
+    manifest_details = {f"{k:g}": v for k, v in sorted(raw_details.items())}
+    bucket_labels = list(manifest_details.keys())
     if args.buckets:
-        wanted = set(args.buckets.split(','))
+        wanted = {f"{float(b.strip()):g}" for b in args.buckets.split(',') if b.strip()}
         bucket_labels = [b for b in bucket_labels if b in wanted]
+
+    man_base = os.path.splitext(os.path.basename(args.model_manifest))[0]
+    ckpt_prefix = '' if man_base == 'size_manifest' else man_base
 
     if not args.synthetic_dataset and not args.real_pairs_dataset:
         print("Provide at least one of --synthetic_dataset or --real_pairs_dataset.")
@@ -207,35 +203,35 @@ def main():
     os.makedirs(args.work_dir, exist_ok=True)
 
     for bucket in bucket_labels:
-        print(f"\n=== Bucket {bucket}% ===")
-        done, detail = bucket_finished(f'clean_{bucket}pct')
+        info = manifest_details[bucket]
+        savename = os.path.join(ckpt_prefix, f'clean_{bucket}pct') if ckpt_prefix else f'clean_{bucket}pct'
+        print(f"\n=== Bucket {bucket}% [{info['min_pct']:g}% - {info['max_pct']:g}%] -> {savename} ===")
+        done, detail = bucket_finished(savename)
         if done and not args.redo_finished:
-            print(f"  Already finished ({detail}); skipping. Tick 'Train finished buckets again' (or pass --redo_finished) to train it again.",
-                  flush=True)
+            print(f"  Already finished ({detail}); skipping. Tick 'Train finished buckets again' (or pass --redo_finished) to train it again.", flush=True)
             continue
         resume = False
         if not args.redo_finished and not args.no_resume:
-            ck = os.path.join(ROOT, 'checkpoints', f'clean_{bucket}pct')
+            ck = os.path.join(ROOT, 'checkpoints', savename)
             resume = os.path.isdir(ck) and any(n.endswith('_G.pth') for n in os.listdir(ck))
         if detail:
-            print(f"  Not finished yet: {detail}. " + ("Resuming from its newest checkpoint." if resume else "Training it from the start."),
-                  flush=True)
+            print(f"  Not finished yet: {detail}. " + ("Resuming from its newest checkpoint." if resume else "Training it from the start."), flush=True)
+
         merged_dir, n_synth, n_real = build_merged_dataset(
             args.work_dir, bucket, args.synthetic_dataset, args.real_pairs_dataset)
         print(f"  merged dataset: {n_synth} synthetic folder(s) + {n_real} real-pair folder(s) -> {merged_dir}")
 
         if n_synth == 0 and n_real == 0:
-            print(f"  no data for this bucket at all, skipping.")
+            print("  no data for this bucket at all, skipping.")
             continue
 
-        savename = f'clean_{bucket}pct'
-        cmd = [resolve_python_exe(), args.train_script,
-               '--dataset', merged_dir,
-               '--savename', savename]
-        # Only pass --dataset_mosaic_pct if there's synthetic data to constrain —
-        # harmless either way, but skip the noise if this bucket is real-pairs-only.
+        cmd = [resolve_python_exe(), args.train_script, '--dataset', merged_dir, '--savename', savename]
         if n_synth > 0:
-            cmd += ['--dataset_mosaic_pct', bucket]
+            cmd += [
+                '--dataset_mosaic_pct', bucket,
+                '--dataset_mosaic_pct_min', str(info['min_pct']),
+                '--dataset_mosaic_pct_max', str(info['max_pct']),
+            ]
         cmd += train_args
         if resume and '--continue_train' not in cmd:
             cmd += ['--continue_train']
@@ -243,30 +239,7 @@ def main():
         print(f"  command: {' '.join(cmd)}")
         if args.dry_run:
             continue
-        # train.py's own path setup is now anchored to its file location (not
-        # CWD), so this doesn't strictly need cwd= to work correctly anymore —
-        # but setting it explicitly (to the project root, matching how the
-        # rest of this project's relative defaults, e.g. model paths, assume
-        # CWD=root) costs nothing and removes any doubt.
-        #
-        # Explicit PIPE + line-by-line streaming here (rather than
-        # subprocess.run(cmd, cwd=ROOT) with no redirection) guarantees
-        # train.py's output flows through THIS script's own stdout — which is
-        # what the GUI actually captures — regardless of how this script
-        # itself was launched (python.exe vs pythonw.exe, with or without a
-        # real console). Relying on inherited stdio handles through a
-        # multi-level subprocess chain is exactly the kind of thing that can
-        # work in one launch context and silently fail in another.
-        #
-        # The output is read as raw bytes and decoded as UTF-8 here. Reading it in
-        # text mode used Windows' default code page (cp1252), which has no
-        # characters for the progress-bar blocks (e.g. the VGG download bar), and
-        # crashed with UnicodeDecodeError. Chunks (not lines) are passed through so
-        # carriage returns survive: progress bars then update in place in the GUI
-        # instead of printing a new line for every update.
-        #
-        # Everything the training prints is also written to a log file, so the
-        # reason for a failure survives even if the window showing it is closed.
+
         print(f"  system: {diagnose.system_status(ROOT)}", flush=True)
         for warning in diagnose.low_resources(ROOT):
             print(f"  ** WARNING: {warning}", flush=True)
@@ -278,8 +251,7 @@ def main():
         printed = 0
         with open(log_path, 'a', encoding='utf-8', errors='replace') as log:
             log.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')}  {' '.join(cmd)}\n")
-            process = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE,
-                                        stderr=subprocess.STDOUT, env=env)
+            process = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
             decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
             while True:
                 chunk = process.stdout.read1(65536)
@@ -296,29 +268,15 @@ def main():
             code = process.returncode
             if code != 0:
                 took = time.time() - started
-                lines = [f"\n  ** Training for bucket {bucket}% FAILED after {took:.0f}s. Exit code {diagnose.explain_exit(code)}"]
-                if printed == 0:
-                    lines.append("  ** It printed nothing at all, so Python itself could not start or was stopped at once. "
-                                 "Check that this Python works: run it in a terminal with:  "
-                                 f"\"{cmd[0]}\" -c \"import torch; print(torch.__version__)\"")
-                else:
-                    lines.append("  ** If there is no 'Traceback' or 'Fatal Python error' above, the process was ended from outside "
-                                 "Python: most often Windows ran out of memory (RAM + page file), or the GPU runtime stopped it.")
-                lines.append(f"  ** System now: {diagnose.system_status(ROOT)}")
-                lines += [f"  ** {w}" for w in diagnose.low_resources(ROOT)]
-                lines.append(f"  ** Full output of this run: {log_path}")
-                lines.append("  ** Stopping here rather than continuing to the next bucket.")
-                msg = "\n".join(lines)
+                msg = (f"\n  ** Training for bucket {bucket}% FAILED after {took:.0f}s. Exit code {diagnose.explain_exit(code)}\n"
+                       f"  ** System now: {diagnose.system_status(ROOT)}\n"
+                       f"  ** Full output of this run: {log_path}")
                 print(msg, flush=True)
                 log.write(msg + "\n")
         if code != 0:
             sys.exit(code if 0 < code < 256 else 1)
 
-    print("\nDone. Trained checkpoints are under checkpoints/<savename>/ as usual for train/clean/train.py — "
-          "pick the checkpoint you want per bucket and copy/rename it into your --model_manifest's expected "
-          "path (e.g. pretrained_models/mosaic/clean_1pct.pth). Copy the matching .json too "
-          "(5000_G.json -> clean_1pct.json): it records the size the model was trained at, which inference reads "
-          "so it runs the model at that size. Without it, inference assumes an original 256px model.")
+    print("\nDone. Trained checkpoints are under checkpoints/<savename>/ — use 'Deploy checkpoints to pretrained' to copy/rename each *_G.pth + .json into your manifest's directory.")
 
 
 if __name__ == '__main__':
